@@ -53,7 +53,7 @@ class Btor2XcfaBuilder {
     val procBuilder =
       XcfaProcedureBuilder(
         "main",
-        if (btor2Passes) Btor2Passes(parseContext, uniqueLogger) else Btor2EmptyPass(),
+        if (btor2Passes) Btor2EmptyPass() else Btor2Passes(parseContext, uniqueLogger),
       )
 
     xcfaBuilder.addEntryPoint(procBuilder, emptyList())
