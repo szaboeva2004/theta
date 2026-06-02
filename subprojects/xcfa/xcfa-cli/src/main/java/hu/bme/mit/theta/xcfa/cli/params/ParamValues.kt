@@ -740,4 +740,5 @@ enum class WitnessLevel {
   NONE,
   SVCOMP,
   ALL,
+  BTOR2
 }

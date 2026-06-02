@@ -16,10 +16,12 @@
 package hu.bme.mit.theta.btor2xcfa
 
 import hu.bme.mit.theta.common.logging.Logger
+import hu.bme.mit.theta.core.decl.VarDecl
 import hu.bme.mit.theta.core.stmt.AssumeStmt
 import hu.bme.mit.theta.core.stmt.HavocStmt
 import hu.bme.mit.theta.core.type.booltype.BoolExprs
 import hu.bme.mit.theta.core.type.bvtype.BvLitExpr
+import hu.bme.mit.theta.frontend.Btor2BadMetaData
 import hu.bme.mit.theta.frontend.ParseContext
 import hu.bme.mit.theta.frontend.models.*
 import hu.bme.mit.theta.frontend.transformation.grammar.preprocess.ArithmeticTrait
@@ -39,13 +41,6 @@ class Btor2XcfaBuilder {
     uniqueLogger: Logger,
   ): XCFA {
     check(circuit.properties.isNotEmpty(), { "Circuit has no error property" })
-
-    // would be nice to check that no operand node (i.e. right side node) is later than it's
-    // operation node (i.e. left side)
-    // but I think we parse it in the right order, so it's the circuit's fault if the above does not
-    // hold
-    val ops = circuit.ops.values.toList()
-    val nodes = circuit.nodes.values.toList()
 
     val xcfaBuilder = XcfaBuilder("Btor2XCFA")
     parseContext.addArithmeticTrait(ArithmeticTrait.BITWISE)
@@ -134,7 +129,8 @@ class Btor2XcfaBuilder {
       procBuilder.addEdge(edge)
       lastLoc = newLoc
     }
-
+    var badIndex = 0
+    val badMetaData = Btor2BadMetaData(mutableMapOf<Int, VarDecl<*>>())
     // Add operations
     circuit.ops.forEach() {
       val loc = nextLoc(false, false, false)
@@ -145,15 +141,17 @@ class Btor2XcfaBuilder {
       procBuilder.addEdge(edge)
       lastLoc = loc
       if (circuit.properties.values.any { property -> property.operand.nid == it.value.nid }) {
-        procBuilder.createErrorLoc()
+
         val badProperty =
           circuit.properties.values.find { property -> property.operand.nid == it.value.nid }
+        badMetaData.badMap[badIndex] = badProperty!!.operand.getVar()!!
+        procBuilder.createErrorLoc(badMetaData)
         procBuilder.addEdge(
           XcfaEdge(
             lastLoc,
             procBuilder.errorLoc.get(),
             StmtLabel(AssumeStmt.of(badProperty!!.getExpr())),
-            EmptyMetaData,
+            EmptyMetaData
           )
         )
         newLoc = nextLoc(false, false, false)
@@ -165,6 +163,7 @@ class Btor2XcfaBuilder {
             EmptyMetaData,
           )
         )
+        badIndex++
         lastLoc = newLoc
       }
     }

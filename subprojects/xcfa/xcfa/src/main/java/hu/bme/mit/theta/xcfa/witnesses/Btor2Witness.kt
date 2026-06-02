@@ -17,28 +17,44 @@
 package hu.bme.mit.theta.xcfa.witnesses
 
 import java.io.File
+import kotlin.text.get
 
-class Btor2Witness(private val badProperty: String = "b0") {
-  private val frames = mutableMapOf<Int, MutableMap<Int, String>>()
-
-  fun addInput(frameIndex: Int, inputId: Int, value: String) {
-    frames.computeIfAbsent(frameIndex) { mutableMapOf() }[inputId] = value
-  }
-
-  fun serialize(witnessFile: File) {
-    witnessFile.printWriter().use { out ->
-      out.println("sat")
-      out.println(badProperty)
-
-      for (frame in frames.keys.sorted()) {
-        out.println("@$frame")
-
-        val inputs = frames[frame]!!
-        for ((id, value) in inputs.entries.sortedBy { it.key }) {
-          out.println("$id $value")
-        }
-      }
-      out.println(".")
+class Btor2Witness(val maxFrameIndex: Int) {
+  // Key is the name of the input e.g. input_32, the list is all of the values it had
+  private val inputList = mutableMapOf<Int, ArrayList<String>>()
+  fun addInputList(currentInputs: List<Pair<Int, String>>) {
+    currentInputs.forEach { (index, value) ->
+      addInput(index, value)
     }
   }
+
+  fun addInput(index: Int, value: String) {
+    if (!inputList.containsKey(index)) {
+      inputList[index] = ArrayList()
+    }
+    inputList[index]!!.add(value)
+  }
+
+  fun addEmptyFrame() {
+      inputList.values.forEach { list ->
+        if (list.isNotEmpty()) {
+          list.add(list.last())
+        }
+      }
+    }
+
+  fun serialize(witnessFile: File) {
+    witnessFile.bufferedWriter().use { out ->
+      out.appendLine("#0")
+      for (frameIndex in 0..maxFrameIndex) {
+        out.appendLine("@$frameIndex")
+        var iter = 0
+        inputList.forEach { (_, values) ->
+          out.appendLine("$iter ${values.get(frameIndex)}")
+        }
+        out.appendLine(".")
+      }
+    }
+  }
+
 }

@@ -21,4 +21,5 @@ dependencies {
     implementation(project(":theta-core"))
     implementation(project(":theta-common"))
     implementation(project(":theta-grammar"))
+    implementation(project(":theta-xcfa"))
 }

@@ -49,6 +49,7 @@ import java.util.stream.Collectors;
 import kotlin.Triple;
 
 public class Btor2XcfaTraceConcretizer {
+
     public static Trace<XcfaState<ExplState>, XcfaAction> btor2ConcreteTrace;
 
     public static Trace<XcfaState<ExplState>, XcfaAction> concretize(

@@ -31,6 +31,7 @@ import hu.bme.mit.theta.c2xcfa.CMetaData
 import hu.bme.mit.theta.common.logging.Logger
 import hu.bme.mit.theta.common.visualization.Graph
 import hu.bme.mit.theta.common.visualization.writer.GraphvizWriter
+import hu.bme.mit.theta.frontend.Btor2BadMetaData
 import hu.bme.mit.theta.frontend.ParseContext
 import hu.bme.mit.theta.graphsolver.patterns.constraints.MCM
 import hu.bme.mit.theta.xcfa.analysis.XcfaAction
@@ -43,6 +44,7 @@ import hu.bme.mit.theta.xcfa.model.XCFA
 import hu.bme.mit.theta.xcfa.model.XcfaLabel
 import hu.bme.mit.theta.xcfa.utils.getFlatLabels
 import java.io.File
+import kotlin.collections.forEach
 
 internal fun postVerificationLogging(
   xcfa: XCFA?,
@@ -110,6 +112,40 @@ internal fun postVerificationLogging(
           )
         }
 
+        forceEnabledOutput || config.outputConfig.witnessConfig.enabled == WitnessLevel.BTOR2 -> {
+          val btor2SatWitnessFile = File(resultFolder, "witness.sat")
+          btor2SatWitnessFile.writeText("sat\n")
+
+          if (safetyResult.isUnsafe && safetyResult.asUnsafe().cex != null) {
+            val trace = retrieveTrace(safetyResult)
+            val concrTrace: Trace<XcfaState<ExplState>, XcfaAction> =
+              concretizeTrace(trace, config, parseContext)
+            val finalStateStr = concrTrace.states.last().sGlobal.toString()
+            val badPropertyIndex = determineViolatedBadProperty(finalStateStr, xcfa!!)
+            btor2SatWitnessFile.appendText("b$badPropertyIndex\n")
+          }
+          try {
+            Btor2WitnessWriter()
+              .writeWitness(
+                safetyResult,
+                config.outputConfig.witnessConfig.inputFileForWitness
+                  ?: config.inputConfig.input!!,
+                config.inputConfig.property,
+                getSolver(
+                  config.outputConfig.witnessConfig.concretizerSolver,
+                  config.outputConfig.witnessConfig.validateConcretizerSolver,
+                ),
+                parseContext,
+                btor2SatWitnessFile,
+                ltlSpecification,
+                null,
+                logger,
+              )
+          } catch (e: Exception) {
+            logger.info("Could not emit witness as YAML file: ${e.stackTraceToString()}")
+          }
+        }
+
         forceEnabledOutput || config.outputConfig.witnessConfig.enabled == WitnessLevel.ALL -> {
           if (safetyResult.isUnsafe && safetyResult.asUnsafe().cex != null) {
             val trace = retrieveTrace(safetyResult)
@@ -165,30 +201,6 @@ internal fun postVerificationLogging(
           } catch (e: Exception) {
             logger.info("Could not emit witness as YAML file: ${e.stackTraceToString()}")
           }
-
-          if (config.frontendConfig.inputType == InputType.BTOR2) {
-            try {
-              val btor2SatWitnessFile = File(resultFolder, "witness.sat")
-              Btor2WitnessWriter()
-                .writeWitness(
-                  safetyResult,
-                  config.outputConfig.witnessConfig.inputFileForWitness
-                    ?: config.inputConfig.input!!,
-                  config.inputConfig.property,
-                  getSolver(
-                    config.outputConfig.witnessConfig.concretizerSolver,
-                    config.outputConfig.witnessConfig.validateConcretizerSolver,
-                  ),
-                  parseContext,
-                  btor2SatWitnessFile,
-                  ltlSpecification,
-                  null,
-                  logger,
-                )
-            } catch (e: Exception) {
-              logger.info("Could not emit witness as YAML file: ${e.stackTraceToString()}")
-            }
-          }
         }
         else -> {}
       }
@@ -197,6 +209,22 @@ internal fun postVerificationLogging(
     }
   }
 }
+
+fun determineViolatedBadProperty(finalStateStr: String, xcfa: XCFA): Int? {
+  var index = 0
+  xcfa.initProcedures.forEach { (proc, _) ->
+    val md = proc.locs.find { it.name == "main_error" }!!.metadata as Btor2BadMetaData
+    md.badMap.forEach { i, decl ->
+      decl.name?.let { badName ->
+        if (finalStateStr.contains("$badName #b1")) {
+          index = i
+        }
+      }
+    }
+  }
+  return index
+}
+
 
 private fun retrieveTrace(safetyResult: SafetyResult<*, *>): Cex? =
   if (safetyResult.asUnsafe().cex is HackyAsgTrace<*>) {

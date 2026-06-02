@@ -16,13 +16,14 @@
 
 package hu.bme.mit.theta.xcfa.cli.utils
 
+import hu.bme.mit.theta.analysis.Trace
 import hu.bme.mit.theta.analysis.algorithm.SafetyResult
 import hu.bme.mit.theta.common.logging.Logger
 import hu.bme.mit.theta.frontend.ParseContext
 import hu.bme.mit.theta.frontend.transformation.ArchitectureConfig
 import hu.bme.mit.theta.solver.SolverFactory
 import hu.bme.mit.theta.xcfa.XcfaProperty
-import hu.bme.mit.theta.xcfa.cli.witnesstransformation.Btor2XcfaTraceConcretizer.btor2ConcreteTrace
+import hu.bme.mit.theta.xcfa.cli.witnesstransformation.Btor2XcfaTraceConcretizer
 import hu.bme.mit.theta.xcfa.witnesses.Btor2Witness
 import java.io.File
 
@@ -41,25 +42,40 @@ class Btor2WitnessWriter : XcfaWitnessWriter {
     architecture: ArchitectureConfig.ArchitectureType?,
     logger: Logger,
   ) {
-    val concrTrace =
-      btor2ConcreteTrace ?: throw RuntimeException("Concrete Trace from Btor2 missing")
+    var concreteTrace: Trace<*, *>? = null
+    if(safetyResult is SafetyResult.Safe) {
+      logger.write(
+        Logger.Level.INFO,
+        "The safety result is safe, so no witness will be generated.\n",
+      )
+      return
+    }
+    else if(safetyResult is SafetyResult.Unsafe) {
+      concreteTrace = Btor2XcfaTraceConcretizer.btor2ConcreteTrace
+    }
+    else {
+      throw IllegalStateException("Unexpected safety result type: ${safetyResult::class}")
+    }
 
-    val witness = Btor2Witness(badProperty = "b0")
-    val regex = """T0::_::input_\w+\s+#b([01]+)""".toRegex()
+    val maxFrameIndex = concreteTrace.states.size - 3
+    val witness = Btor2Witness(maxFrameIndex)
+    val inputRegex = """T0::_::input_(\d+)\s+#b([01]+)""".toRegex()
 
-    var iter = 0
-    var inputIter = 0
-
-    for (state in concrTrace.states) {
-      val values = regex.findAll(state.sGlobal.toString()).map { it.groupValues[1] }.toList()
-
-      if (!values.isEmpty()) {
-        for (value in values) {
-          witness.addInput(iter, inputIter, value)
-          inputIter++
+    for (i in 2 until maxFrameIndex + 2) {
+      val currentInputs = inputRegex.findAll(concreteTrace.states.get(i).toString())
+        .map { matchResult ->
+          val index = matchResult.groupValues[1].toInt()
+          val value = matchResult.groupValues[2]
+          index to value
         }
-        iter++
-        inputIter = 0
+        .sortedBy { it.first } // Sort by numeric index in ascending order
+        .toList()
+
+      if(currentInputs.isEmpty()) {
+        witness.addEmptyFrame()
+      }
+      else {
+        witness.addInputList(currentInputs)
       }
     }
 
