@@ -17,6 +17,7 @@
 package hu.bme.mit.theta.xcfa.witnesses
 
 import java.io.File
+import java.io.FileOutputStream
 import kotlin.text.get
 
 class Btor2Witness(val maxFrameIndex: Int) {
@@ -44,16 +45,17 @@ class Btor2Witness(val maxFrameIndex: Int) {
     }
 
   fun serialize(witnessFile: File) {
-    witnessFile.bufferedWriter().use { out ->
+    FileOutputStream(witnessFile, true).bufferedWriter().use { out ->
       out.appendLine("#0")
-      for (frameIndex in 0..maxFrameIndex) {
+      for (frameIndex in 0 until maxFrameIndex) {
         out.appendLine("@$frameIndex")
         var iter = 0
         inputList.forEach { (_, values) ->
           out.appendLine("$iter ${values.get(frameIndex)}")
+          ++iter
         }
-        out.appendLine(".")
       }
+      out.appendLine(".")
     }
   }
 
