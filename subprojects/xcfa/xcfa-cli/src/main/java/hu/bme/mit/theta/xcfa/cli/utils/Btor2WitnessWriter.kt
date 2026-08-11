@@ -43,17 +43,15 @@ class Btor2WitnessWriter : XcfaWitnessWriter {
     logger: Logger,
   ) {
     var concreteTrace: Trace<*, *>? = null
-    if(safetyResult is SafetyResult.Safe) {
+    if (safetyResult is SafetyResult.Safe) {
       logger.write(
         Logger.Level.INFO,
         "The safety result is safe, so no witness will be generated.\n",
       )
       return
-    }
-    else if(safetyResult is SafetyResult.Unsafe) {
+    } else if (safetyResult is SafetyResult.Unsafe) {
       concreteTrace = Btor2XcfaTraceConcretizer.btor2ConcreteTrace
-    }
-    else {
+    } else {
       throw IllegalStateException("Unexpected safety result type: ${safetyResult::class}")
     }
 
@@ -62,19 +60,20 @@ class Btor2WitnessWriter : XcfaWitnessWriter {
     val inputRegex = """T0::_::input_(\d+)\s+#b([01]+)""".toRegex()
 
     for (i in 2 until maxFrameIndex + 2) {
-      val currentInputs = inputRegex.findAll(concreteTrace.states.get(i).toString())
-        .map { matchResult ->
-          val index = matchResult.groupValues[1].toInt()
-          val value = matchResult.groupValues[2]
-          index to value
-        }
-        .sortedBy { it.first } // Sort by numeric index in ascending order
-        .toList()
+      val currentInputs =
+        inputRegex
+          .findAll(concreteTrace.states.get(i).toString())
+          .map { matchResult ->
+            val index = matchResult.groupValues[1].toInt()
+            val value = matchResult.groupValues[2]
+            index to value
+          }
+          .sortedBy { it.first } // Sort by numeric index in ascending order
+          .toList()
 
-      if(currentInputs.isEmpty()) {
+      if (currentInputs.isEmpty()) {
         witness.addEmptyFrame()
-      }
-      else {
+      } else {
         witness.addInputList(currentInputs)
       }
     }

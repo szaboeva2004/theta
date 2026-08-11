@@ -20,9 +20,7 @@ import hu.bme.mit.theta.core.decl.VarDecl
 import hu.bme.mit.theta.xcfa.model.EmptyMetaData
 import hu.bme.mit.theta.xcfa.model.MetaData
 
-class Btor2BadMetaData(
-  val badMap: MutableMap<Int, VarDecl<*>>
-) : MetaData() {
+class Btor2BadMetaData(val badMap: MutableMap<Int, VarDecl<*>>) : MetaData() {
 
   override fun combine(other: MetaData): MetaData {
     return when (other) {
@@ -31,7 +29,10 @@ class Btor2BadMetaData(
         Btor2BadMetaData(combinedMap)
       }
       is EmptyMetaData -> this
-      else -> throw IllegalArgumentException("Cannot combine Btor2BadMetaData with ${other::class.simpleName}")
+      else ->
+        throw IllegalArgumentException(
+          "Cannot combine Btor2BadMetaData with ${other::class.simpleName}"
+        )
     }
   }
 

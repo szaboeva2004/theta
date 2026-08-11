@@ -23,10 +23,9 @@ import kotlin.text.get
 class Btor2Witness(val maxFrameIndex: Int) {
   // Key is the name of the input e.g. input_32, the list is all of the values it had
   private val inputList = mutableMapOf<Int, ArrayList<String>>()
+
   fun addInputList(currentInputs: List<Pair<Int, String>>) {
-    currentInputs.forEach { (index, value) ->
-      addInput(index, value)
-    }
+    currentInputs.forEach { (index, value) -> addInput(index, value) }
   }
 
   fun addInput(index: Int, value: String) {
@@ -37,12 +36,12 @@ class Btor2Witness(val maxFrameIndex: Int) {
   }
 
   fun addEmptyFrame() {
-      inputList.values.forEach { list ->
-        if (list.isNotEmpty()) {
-          list.add(list.last())
-        }
+    inputList.values.forEach { list ->
+      if (list.isNotEmpty()) {
+        list.add(list.last())
       }
     }
+  }
 
   fun serialize(witnessFile: File) {
     FileOutputStream(witnessFile, true).bufferedWriter().use { out ->
@@ -58,5 +57,4 @@ class Btor2Witness(val maxFrameIndex: Int) {
       out.appendLine(".")
     }
   }
-
 }

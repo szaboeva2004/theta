@@ -151,7 +151,7 @@ class Btor2XcfaBuilder {
             lastLoc,
             procBuilder.errorLoc.get(),
             StmtLabel(AssumeStmt.of(badProperty!!.getExpr())),
-            EmptyMetaData
+            EmptyMetaData,
           )
         )
         newLoc = nextLoc(false, false, false)

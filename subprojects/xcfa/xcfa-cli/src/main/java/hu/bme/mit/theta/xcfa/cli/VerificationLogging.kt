@@ -128,8 +128,7 @@ internal fun postVerificationLogging(
             Btor2WitnessWriter()
               .writeWitness(
                 safetyResult,
-                config.outputConfig.witnessConfig.inputFileForWitness
-                  ?: config.inputConfig.input!!,
+                config.outputConfig.witnessConfig.inputFileForWitness ?: config.inputConfig.input!!,
                 config.inputConfig.property,
                 getSolver(
                   config.outputConfig.witnessConfig.concretizerSolver,
@@ -224,7 +223,6 @@ fun determineViolatedBadProperty(finalStateStr: String, xcfa: XCFA): Int? {
   }
   return index
 }
-
 
 private fun retrieveTrace(safetyResult: SafetyResult<*, *>): Cex? =
   if (safetyResult.asUnsafe().cex is HackyAsgTrace<*>) {
