@@ -38,25 +38,25 @@ class Btor2Visitor(val logger: Logger) : Btor2BaseVisitor<Btor2Circuit>() {
 
   override fun visitSort(ctx: Btor2Parser.SortContext?): Btor2Circuit {
     val result = sortVisitor.visit(ctx)
-    logger.write(Logger.Level.VERBOSE, "Sort visited {$result}\n")
+    logger.write(Logger.Level.VERBOSE, "Sort visited {%s}\n", result)
     return circuit
   }
 
   override fun visitConstantNode(ctx: Btor2Parser.ConstantNodeContext): Btor2Circuit {
     val result = constantVisitor.visit(ctx)
-    logger.write(Logger.Level.VERBOSE, "Constant visited {$result}\n")
+    logger.write(Logger.Level.VERBOSE, "Constant visited {%s}\n", result)
     return circuit
   }
 
   override fun visitOperation(ctx: Btor2Parser.OperationContext): Btor2Circuit {
     val result = operationVisitor.visit(ctx)
-    logger.write(Logger.Level.VERBOSE, "Operation visited {$result}\n")
+    logger.write(Logger.Level.VERBOSE, "Operation visited {%s}\n", result)
     return circuit
   }
 
   override fun visitStateful(ctx: Btor2Parser.StatefulContext?): Btor2Circuit {
     val result = statefulVisitor.visit(ctx)
-    logger.write(Logger.Level.VERBOSE, "Stateful visited {$result}\n")
+    logger.write(Logger.Level.VERBOSE, "Stateful visited {%s}\n", result)
     return circuit
   }
 }

@@ -101,6 +101,9 @@ abstract class Btor2Node(id: UInt, btor2Sort: Btor2Sort? = null) {
   abstract fun <R, P> accept(visitor: Btor2NodeVisitor<R, P>, param: P): R
 
   abstract fun getExpr(): Expr<*>
+
+  // Final, so data subclasses do not generate a toString that expands the operand DAG as a tree.
+  final override fun toString(): String = "${this::class.simpleName}(nid=$nid)"
 }
 
 abstract class Btor2Sort(sid: UInt, width: UInt) {
