@@ -1,5 +1,5 @@
 /*
- *  Copyright 2025 Budapest University of Technology and Economics
+ *  Copyright 2026 Budapest University of Technology and Economics
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -23,9 +23,11 @@ import hu.bme.mit.theta.core.stmt.MemoryAssignStmt
 import hu.bme.mit.theta.core.stmt.Stmt
 import hu.bme.mit.theta.core.stmt.Stmts.Assume
 import hu.bme.mit.theta.core.type.Expr
+import hu.bme.mit.theta.core.type.LitExpr
 import hu.bme.mit.theta.core.type.Type
 import hu.bme.mit.theta.core.type.abstracttype.AbstractExprs.*
 import hu.bme.mit.theta.core.type.anytype.Dereference
+import hu.bme.mit.theta.core.type.anytype.IteExpr
 import hu.bme.mit.theta.core.type.arraytype.ArrayReadExpr
 import hu.bme.mit.theta.core.type.booltype.AndExpr
 import hu.bme.mit.theta.core.type.booltype.BoolExprs.And
@@ -33,13 +35,21 @@ import hu.bme.mit.theta.core.type.booltype.BoolExprs.Not
 import hu.bme.mit.theta.core.type.booltype.BoolExprs.Or
 import hu.bme.mit.theta.core.type.booltype.BoolType
 import hu.bme.mit.theta.core.type.booltype.OrExpr
+import hu.bme.mit.theta.core.type.bvtype.BvType
+import hu.bme.mit.theta.core.type.inttype.IntType
+import hu.bme.mit.theta.core.utils.TypeUtils.cast
+import hu.bme.mit.theta.frontend.FlatAddressSpace
 import hu.bme.mit.theta.frontend.ParseContext
+import hu.bme.mit.theta.frontend.transformation.model.types.complex.CComplexType
 import hu.bme.mit.theta.frontend.transformation.model.types.complex.compound.CPointer
 import hu.bme.mit.theta.frontend.transformation.model.types.complex.integer.Fitsall
 import hu.bme.mit.theta.xcfa.ErrorDetection
 import hu.bme.mit.theta.xcfa.XcfaProperty
 import hu.bme.mit.theta.xcfa.model.*
+import hu.bme.mit.theta.xcfa.utils.POINTER_BASE_CLASSES
 import hu.bme.mit.theta.xcfa.utils.dereferences
+import hu.bme.mit.theta.xcfa.utils.ensureMallocVar
+import hu.bme.mit.theta.xcfa.utils.mallocVar
 
 /**
  * Adds assumptions to the XCFA if memory safety needs to be checked. Rules based on:
@@ -61,15 +71,16 @@ import hu.bme.mit.theta.xcfa.utils.dereferences
 class MemsafetyPass(private val property: XcfaProperty, private val parseContext: ParseContext) :
   ProcedurePass {
 
-  companion object {
-
-    var enabled = false
-  }
-
   override fun run(builder: XcfaProcedureBuilder): XcfaProcedureBuilder {
-    if (!enabled) return builder
+    if (!parseContext.isCheckMemsafety) return blockNullDerefs(builder)
 
     breakUpErrors(builder)
+
+    // The deref check bounds addresses by the allocation counter, so it must exist even when the
+    // program allocates nothing at runtime; seeding it also registers the static slots.
+    if (parseContext.memoryModel.flatAddressing()) {
+      builder.parent.ensureMallocVar(parseContext, pointerType)
+    }
 
     annotateFree(builder)
 
@@ -116,10 +127,25 @@ class MemsafetyPass(private val property: XcfaProperty, private val parseContext
             val argument = invokeLabel.params[1]
             val sizeVar = builder.parent.getPtrSizeVar()
             val derefAssume =
-              Or(
-                Lt(argument, pointerType.nullValue), // uninit ptr
-                // freed/not big enough ptr
-                Lt(ArrayReadExpr.create<Type, Type>(sizeVar.ref, argument), pointerType.nullValue),
+              And(
+                // "If ptr is a null pointer, no action occurs" -- C17 7.22.3.3. `free(NULL)` is not
+                // merely tolerated, it is the idiom every cleanup path is written around, and it
+                // was
+                // being reported as an invalid free: a null pointer has no recorded size, so the
+                // bound below took it for one that was never allocated.
+                Neq(argument, pointerType.nullValue),
+                Or(
+                  Lt(argument, pointerType.nullValue), // uninit ptr
+                  // Already freed, or never allocated: both leave size 0 (see deallocate). The
+                  // bound
+                  // is Fitsall-typed like the sizes the array holds -- a pointer-typed zero would
+                  // be
+                  // a different, narrower type under bitvector arithmetic.
+                  Leq(ArrayReadExpr.create<Type, Type>(sizeVar.ref, argument), fitsall.nullValue),
+                  // Only the heap may be freed; the size check above cannot catch the rest, since
+                  // an alloca'd block records a real size too.
+                  notHeap(builder, argument),
+                ),
               )
 
             builder.addEdge(
@@ -145,14 +171,18 @@ class MemsafetyPass(private val property: XcfaProperty, private val parseContext
                 it.metadata,
               )
             )
-            builder.addEdge(
-              XcfaEdge(invalidFree, errorLoc, SequenceLabel(listOf(NopLabel)), it.metadata)
-            )
           } else {
             builder.addEdge(it)
           }
         }
       }
+    }
+    // A single shared exit edge: one per check would pile up parallel label-less edges on
+    // `invalidFree`, which the OC backend rejects as a branching location without assumes.
+    if (invalidFree.incomingEdges.isNotEmpty()) {
+      builder.addEdge(
+        XcfaEdge(invalidFree, errorLoc, SequenceLabel(listOf(NopLabel)), EmptyMetaData)
+      )
     }
   }
 
@@ -173,19 +203,30 @@ class MemsafetyPass(private val property: XcfaProperty, private val parseContext
               !builder.ptrSizeAssign(it.label.labels[0])
           ) {
             // if dereference is in a short-circuiting path, add prior assumptions as well.
+            val witnesses = mutableListOf<XcfaLabel>()
             val derefAssume =
               Or(
                 it.label.labels[0].derefsWithShortCircuitCond.map { (deref, shortCircuitConds) ->
                   val sizeVar = builder.parent.getPtrSizeVar()
+                  if (parseContext.memoryModel.flatAddressing()) {
+                    val (witnessLabels, bad) = flatDerefCheck(builder, deref)
+                    witnesses.addAll(witnessLabels)
+                    return@map And(And(shortCircuitConds), bad)
+                  }
+                  val sizeKey = deref.array
+                  val indexInObject = deref.offset.toFitsall()
                   And(
                     And(shortCircuitConds),
                     Or(
-                      Leq(deref.array, pointerType.nullValue), // uninit ptr
+                      Leq(sizeKey, pointerType.nullValue), // uninit ptr
+                      // Sizes are Fitsall-typed, offsets are pointer-typed: the offset has to be
+                      // widened to compare against a size (they are the same unbounded Int under
+                      // integer arithmetic, but different bitvector widths otherwise).
                       Leq(
-                        ArrayReadExpr.create<Type, Type>(sizeVar.ref, deref.array),
-                        deref.offset,
+                        ArrayReadExpr.create<Type, Type>(sizeVar.ref, sizeKey),
+                        indexInObject,
                       ), // freed/not big enough ptr
-                      Lt(deref.offset, fitsall.nullValue), // negative index
+                      Lt(indexInObject, fitsall.nullValue), // negative index
                     ),
                   )
                 }
@@ -193,10 +234,11 @@ class MemsafetyPass(private val property: XcfaProperty, private val parseContext
             builder.addEdge(
               it.withLabel(
                 SequenceLabel(
-                  listOf(
-                    StmtLabel(Assume(Not(derefAssume)), metadata = it.label.labels[0].metadata),
-                    it.label,
-                  )
+                  witnesses +
+                    listOf(
+                      StmtLabel(Assume(Not(derefAssume)), metadata = it.label.labels[0].metadata),
+                      it.label,
+                    )
                 )
               )
             )
@@ -205,13 +247,11 @@ class MemsafetyPass(private val property: XcfaProperty, private val parseContext
                 it.source,
                 badDeref,
                 SequenceLabel(
-                  listOf(StmtLabel(Assume(derefAssume), metadata = it.label.labels[0].metadata))
+                  witnesses +
+                    listOf(StmtLabel(Assume(derefAssume), metadata = it.label.labels[0].metadata))
                 ), // deref(x a), x <= 0 || a >= sizeof(x)
                 it.metadata,
               )
-            )
-            builder.addEdge(
-              XcfaEdge(badDeref, errorLoc, SequenceLabel(listOf(NopLabel)), it.metadata)
             )
           } else {
             builder.addEdge(it)
@@ -219,7 +259,144 @@ class MemsafetyPass(private val property: XcfaProperty, private val parseContext
         }
       }
     }
+    // A single shared exit edge: one per check would pile up parallel label-less edges on
+    // `badDeref`, which the OC backend rejects as a branching location without assumes.
+    if (badDeref.incomingEdges.isNotEmpty()) {
+      builder.addEdge(XcfaEdge(badDeref, errorLoc, SequenceLabel(listOf(NopLabel)), EmptyMetaData))
+    }
   }
+
+  /**
+   * Without the memory-safety properties, a dereference of NULL crashes the program, so it ends the
+   * path instead of reading or writing memory at address zero (e.g., after a failed `malloc`).
+   */
+  private fun blockNullDerefs(builder: XcfaProcedureBuilder): XcfaProcedureBuilder {
+    for (edge in ArrayList(builder.getEdges())) {
+      val guarded = guardNullDerefs(edge.label)
+      if (guarded == listOf(edge.label) || guarded == (edge.label as? SequenceLabel)?.labels)
+        continue
+      builder.removeEdge(edge)
+      builder.addEdge(edge.withLabel(SequenceLabel(guarded, edge.label.metadata)))
+    }
+    return builder
+  }
+
+  /** [label], each dereferencing step preceded by an assumption that its base is not NULL. */
+  private fun guardNullDerefs(label: XcfaLabel): List<XcfaLabel> =
+    when (label) {
+      is SequenceLabel -> label.labels.flatMap(::guardNullDerefs)
+      is NondetLabel -> {
+        val branches =
+          label.labels.map { branch ->
+            val guarded = guardNullDerefs(branch)
+            if (guarded == listOf(branch)) branch else SequenceLabel(guarded)
+          }
+        if (branches.toSet() == label.labels) listOf(label)
+        else listOf(NondetLabel(branches.toSet(), label.metadata))
+      }
+      else -> {
+        // A literal base is a static object, or left unguarded as before.
+        val derefs = label.derefsWithShortCircuitCond.filter { it.first.array !is LitExpr<*> }
+        if (derefs.isEmpty()) listOf(label)
+        else {
+          val isNull =
+            Or(
+              derefs.map { (deref, conds) ->
+                And(And(conds), Eq(pointerType.castTo(deref.array), pointerType.nullValue))
+              }
+            )
+          listOf(StmtLabel(Assume(Not(isNull)), metadata = label.metadata), label)
+        }
+      }
+    }
+
+  /**
+   * The offset of [deref]'s last byte from its first under the bytes model, from the width of the
+   * value it accesses (its recorded C type is its address); 0 elsewhere.
+   */
+  private fun lastByte(deref: Dereference<*, *, *>): Int {
+    if (!parseContext.memoryModel.byteAddressed()) return 0
+    val bits = (deref.type as? BvType)?.size ?: return 0
+    return maxOf((bits + 7) / 8 - 1, 0)
+  }
+
+  /**
+   * The valid-deref check of [deref] under flat addressing, which has no object base to read off
+   * the address. A fresh witness `w` is assumed to be the start of the slot containing the address
+   * `a` -- exactly one does when `a` is in `[FIRST, __malloc)`, as the slots tile that range -- and
+   * the access is bad when `a` is outside the range or past the live size of `w`'s object. When the
+   * dereference's base is itself a slot start holding `a`, `w` is that base, and the check reads it
+   * directly.
+   *
+   * Returns the labels introducing the witness, and the bad condition.
+   */
+  private fun flatDerefCheck(
+    builder: XcfaProcedureBuilder,
+    deref: Dereference<*, *, *>,
+  ): Pair<List<XcfaLabel>, Expr<BoolType>> {
+    val ptr = pointerType.smtType
+    val sizeVar = builder.parent.getPtrSizeVar()
+    val extentVar = builder.parent.getObjExtentVar()!!
+    val counter = builder.parent.mallocVar(parseContext)
+    val witness = Var("__theta_slot_${witnessCount++}", ptr)
+    builder.addVar(witness)
+    val addr =
+      Add(cast(pointerType.castTo(deref.array), ptr), cast(pointerType.castTo(deref.offset), ptr))
+    val inRange =
+      And(
+        Geq(addr, pointerType.getValue(FlatAddressSpace.FIRST.toString())),
+        Lt(addr, cast(counter.ref, ptr)),
+      )
+    val index = Sub(addr, witness.ref).toFitsall()
+    val extent = ArrayReadExpr.create<Type, Type>(extentVar.ref, witness.ref)
+    val inSlot =
+      And(listOf(Leq(witness.ref, addr), Lt(index, extent), Gt(extent, fitsall.nullValue)))
+    val size = ArrayReadExpr.create<Type, Type>(sizeVar.ref, witness.ref)
+    // Fast path: the base is a slot start and the offset lies in its slot, so the witness can only
+    // be the base. Deciding that without the witness is what keeps the common access cheap.
+    val base = cast(pointerType.castTo(deref.array), ptr)
+    val offset = cast(pointerType.castTo(deref.offset), ptr).toFitsall()
+    val baseExtent = ArrayReadExpr.create<Type, Type>(extentVar.ref, base)
+    val direct =
+      And(
+        listOf(
+          Gt(baseExtent, fitsall.nullValue),
+          Geq(offset, fitsall.nullValue),
+          Lt(offset, baseExtent),
+        )
+      )
+    val baseSize = ArrayReadExpr.create<Type, Type>(sizeVar.ref, base)
+    // Under bytes the access spans its value's bytes, all of which must be in the object.
+    val last = fitsall.getValue("${lastByte(deref)}")
+    @Suppress("UNCHECKED_CAST")
+    val bad =
+      Ite<BoolType>(
+        direct,
+        Leq(baseSize, Add(offset, last)),
+        Or(Not(inRange), Leq(size, Add(index, last))),
+      )
+        as Expr<BoolType>
+    return Pair(
+      listOf(StmtLabel(HavocStmt.of(witness)), StmtLabel(Assume(Or(Not(inRange), inSlot)))),
+      bad,
+    )
+  }
+
+  private var witnessCount = 0
+
+  /** Whether [ptr] is not the start of a heap block, i.e. may not be freed. */
+  private fun notHeap(builder: XcfaProcedureBuilder, ptr: Expr<*>): Expr<BoolType> {
+    val heapVar = builder.parent.getObjHeapVar()
+    return if (heapVar != null)
+      Eq(ArrayReadExpr.create<Type, Type>(heapVar.ref, ptr), fitsall.nullValue)
+    else
+    // The `3k+0` class (see POINTER_BASE_CLASSES). `Rem`, not `Mod`: pointer types are unsigned
+    // bitvectors and Theta's `Mod` is signed-only.
+    Neq(Rem(ptr, pointerType.getValue("$POINTER_BASE_CLASSES")), pointerType.nullValue)
+  }
+
+  private fun Expr<*>.toFitsall(): Expr<*> =
+    if (fitsall.smtType is IntType) this else fitsall.castTo(this)
 
   fun annotateLost(builder: XcfaProcedureBuilder) {
     val errorLoc =
@@ -235,11 +412,43 @@ class MemsafetyPass(private val property: XcfaProperty, private val parseContext
         ?: XcfaGlobalVar(Var("__ptr", sizeVar.type.indexType), pointerType.nullValue)
           .also { builder.parent.addVar(it) }
           .wrappedVar
-    val remained = // 3k+0: malloc
-      Gt(
-        ArrayReadExpr.create<Type, Type>(sizeVar.ref, Mul(anyBase.ref, pointerType.getValue("3"))),
-        fitsall.nullValue,
-      )
+    // Ranges over heap block starts: the 3k+0 class under multi, the heap ghost under flat.
+    val heapVar = builder.parent.getObjHeapVar()
+    val mallocBase =
+      if (heapVar != null) anyBase.ref
+      else Mul(anyBase.ref, pointerType.getValue("$POINTER_BASE_CLASSES"))
+    val liveSize = Gt(ArrayReadExpr.create<Type, Type>(sizeVar.ref, mallocBase), fitsall.nullValue)
+    val stillAllocated =
+      if (heapVar != null) And(liveSize, Not(notHeap(builder, mallocBase))) else liveSize
+
+    // valid-memtrack is "pointed to OR deallocated" -- Valgrind's *definitely* lost -- so a block a
+    // live pointer still names is tracked, freed or not. Checking only whether everything was freed
+    // reported a leak for the ordinary `char *v; v = malloc(1);` shape, where the global keeps
+    // pointing at the block for the whole run and nothing is ever lost (sv-benchmarks `singleton`
+    // and friends expect `true` there). Locals are gone by the final location, so the pointers that
+    // can still name a block are the global ones; a block reachable only *through* another heap
+    // block is not covered, which keeps this on the safe side -- it can only report a leak that is
+    // not one, never miss one.
+    // ...but only for valid-memtrack. `valid-memcleanup` is the stricter property: *all* memory
+    // must be released before the program exits, and whether something still points at a block is
+    // beside the point -- `CWE401_Memory_Leak`, a global holding a never-freed malloc, is a
+    // violation of memcleanup and not of memtrack. Applying the exemption to both turned 32 of
+    // those from correct into missed leaks.
+    val trackedIfPointedTo = property.inputProperty != ErrorDetection.MEMCLEANUP
+    val globalPointers =
+      if (!trackedIfPointedTo) emptyList()
+      else
+        builder.parent
+          .getVars()
+          .map { it.wrappedVar }
+          .filter { it != anyBase && it != sizeVar }
+          // A ghost (`__malloc`, the slot arrays) may have no C type at all; it is not a pointer.
+          .filter {
+            runCatching { CComplexType.getType(it.ref, parseContext) }.getOrNull() is CPointer
+          }
+    val pointedTo = globalPointers.map { Eq(cast(it.ref, mallocBase.type), mallocBase) }
+    val remained =
+      if (pointedTo.isEmpty()) stillAllocated else And(stillAllocated, Not(Or(pointedTo)))
 
     val preFinalHavoc = XcfaLocation("_pre_final_havoc", metadata = EmptyMetaData)
     val preFinal = XcfaLocation("_pre_final", metadata = EmptyMetaData)
@@ -326,6 +535,15 @@ class MemsafetyPass(private val property: XcfaProperty, private val parseContext
             derefs
           }
         }
+
+        is IteExpr<*> ->
+          cond.derefsWithShortCircuitCond +
+            then.derefsWithShortCircuitCond.map { (deref, conds) ->
+              deref to (listOf(cond) + conds)
+            } +
+            `else`.derefsWithShortCircuitCond.map { (deref, conds) ->
+              deref to (listOf(Not(cond)) + conds)
+            }
 
         is Dereference<*, *, *> -> {
           ops.flatMap { it.derefsWithShortCircuitCond } + listOf(this to listOf())

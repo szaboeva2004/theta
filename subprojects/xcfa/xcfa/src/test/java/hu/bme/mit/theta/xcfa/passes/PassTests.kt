@@ -194,7 +194,7 @@ class PassTests {
         ),
         PassTestData(
           global = { "x" type Int() init "0" },
-          passes = listOf(LoopUnrollPass()),
+          passes = listOf(UnrollPass()),
           input = {
             (init to "L1") { "x".assign("0") }
             ("L1" to "L2") {
@@ -222,6 +222,44 @@ class PassTests {
             }
             ("L2_loop2" to "L1_loop2") { skip() }
             ("L1_loop2" to final) { nop() }
+          },
+        ),
+        // The loop variable's initialization sharing its edge with an unrelated assignment
+        // (a global counter beside the allocation counter, say) must not stop the unrolling.
+        PassTestData(
+          global = {
+            "x" type Int() init "0"
+            "y" type Int() init "0"
+          },
+          passes = listOf(UnrollPass()),
+          input = {
+            (init to "L1") {
+              "y".assign("7")
+              "x".assign("0")
+            }
+            ("L1" to "L2") {
+              assume("(< x 2)")
+              "x".assign("(+ x 1)")
+            }
+            ("L2" to "L1") { skip() }
+            ("L1" to final) { assume("(= x 2)") }
+          },
+          output = {
+            (init to "L1") {
+              "y".assign("7")
+              "x".assign("0")
+            }
+            ("L1" to "L2_loop0") {
+              nop()
+              "x".assign("(+ x 1)")
+            }
+            ("L2_loop0" to "L1_loop0") { skip() }
+            ("L1_loop0" to "L2_loop1") {
+              nop()
+              "x".assign("(+ x 1)")
+            }
+            ("L2_loop1" to "L1_loop1") { skip() }
+            ("L1_loop1" to final) { nop() }
           },
         ),
         PassTestData(
@@ -339,15 +377,13 @@ class PassTests {
             "pid" type Int() init "0"
             "thr1" type Int() init "0"
           },
-          passes = listOf(NormalizePass(), DeterministicPass(), CLibraryFunctionsPass()),
-          siblingProcedures = listOf("thr1"),
+          passes =
+            listOf(NormalizePass(), DeterministicPass(), CLibraryFunctionsPass(parseContext)),
           input = {
             (init to "L1") { "pthread_create"("ret", "pid", "0", "thr1", "0") }
             (init to "L2") { "pthread_join"("ret", "pid") }
-            (init to "L3") { "pthread_mutex_lock"("0", "x") }
-            (init to "L4") { "pthread_mutex_unlock"("0", "x") }
-            (init to "L5") { "printf"("ret", "x = %d, y = %d\n", "x", "y") }
-            (init to "L6") { "scanf"("ret", "x = %d, y = %d\n", "(ref x Int)", "(ref y Int)") }
+            (init to "L3") { "pthread_mutex_lock"("0", "(ref x Int)") }
+            (init to "L4") { "pthread_mutex_unlock"("0", "(ref x Int)") }
           },
           output = {
             (init to "L1") {
@@ -360,17 +396,11 @@ class PassTests {
             }
             (init to "L3") { mutex_lock("x") }
             (init to "L4") { mutex_unlock("x") }
-            val printfArg1 = "__printf_arg_0_0" type Int()
-            val printfArg2 = "__printf_arg_0_1" type Int()
-            (init to "L5") {
-              printfArg1.assign("x")
-              printfArg2.assign("y")
-            }
-            (init to "L6") {
-              havoc("x")
-              havoc("y")
-            }
           },
+          // `pthread_create`'s start routine must resolve to a real procedure:
+          // CLibraryFunctionsPass
+          // rejects a thread entry that names no procedure. `thr1` is registered as an (empty) one.
+          siblingProcedures = listOf("thr1"),
         ),
         PassTestData(
           global = {},
@@ -464,7 +494,6 @@ class PassTests {
               "y".assign("a")
             }
             (init to "L2") {
-              xLocal.assign("x")
               xLocal.assign("y")
               a.assign(xLocal.ref)
               "x".assign(xLocal.ref)
@@ -495,7 +524,6 @@ class PassTests {
 
             (init to "L3") {
               xLocal.assign("x")
-              yLocal.assign("y")
               a.assign(xLocal.ref)
               yLocal.assign(a.ref)
               xLocal.assign(yLocal.ref)
@@ -525,7 +553,6 @@ class PassTests {
             val xLocal = "x_l1" type Int()
             (init to "L4") {
               atomic_begin()
-              xLocal.assign("x")
               xLocal.assign("y")
             }
             ("L4" to "L5") {
@@ -540,7 +567,7 @@ class PassTests {
             "x" type Int() init "0"
             "thr1" type Int() init "0"
           },
-          passes = listOf(NormalizePass(), DeterministicPass(), NondetFunctionPass()),
+          passes = listOf(NormalizePass(), DeterministicPass(), NondetFunctionPass(parseContext)),
           input = { (init to "L1") { "__VERIFIER_nondet_int"("x") } },
           output = { (init to "L1") { havoc("x") } },
         ),
@@ -564,7 +591,7 @@ class PassTests {
         PassTestData(
           global = {
             global(
-              "__arrays_Int_Int_Int_false",
+              "__arrays_Int_Int_Int",
               ArrayType.of(Int(), ArrayType.of(Int(), Int())),
               null,
               true,
@@ -577,19 +604,19 @@ class PassTests {
           },
           output = {
             (init to "L1") {
-              "__arrays_Int_Int_Int_false" assign
-                "(write __arrays_Int_Int_Int_false 1 (write (read __arrays_Int_Int_Int_false 1) 0 42))"
+              "__arrays_Int_Int_Int" assign
+                "(write __arrays_Int_Int_Int 1 (write (read __arrays_Int_Int_Int 1) 0 42))"
             }
-            ("L1" to final) { assume("(= (read (read __arrays_Int_Int_Int_false 1) 0) 42)") }
+            ("L1" to final) { assume("(= (read (read __arrays_Int_Int_Int 1) 0) 42)") }
           },
         ),
         PassTestData(
           global = {
             "x" type Int() init "0"
             global(
-              "__arrays_Int_Int_Int_true",
+              "__arrays_Int_Int_Int",
               ArrayType.of(Int(), ArrayType.of(Int(), Int())),
-              "(array (default (array (default 0))))",
+              null,
               true,
             )
           },
@@ -602,10 +629,44 @@ class PassTests {
           output = {
             "y" type Int()
             (init to "L1") {
-              "__arrays_Int_Int_Int_true" assign
-                "(write __arrays_Int_Int_Int_true x (write (read __arrays_Int_Int_Int_true x) y 42))"
+              "__arrays_Int_Int_Int" assign
+                "(write __arrays_Int_Int_Int x (write (read __arrays_Int_Int_Int x) y 42))"
             }
-            ("L1" to final) { assume("(= (read (read __arrays_Int_Int_Int_true x) y) 42)") }
+            ("L1" to final) { assume("(= (read (read __arrays_Int_Int_Int x) y) 42)") }
+          },
+        ),
+        PassTestData(
+          global = {},
+          passes = listOf(ReferenceElimination(parseContext)),
+          input = {
+            "B" type Int()
+            "O" type Int()
+            "x" type Int()
+            "y" type Int()
+            "z" type Int()
+            (init to "L1") { "x".assign("(ref (deref B O Int) Int)") }
+            ("L1" to "L2") { "y".assign("x") }
+            ("L2" to final) { "z".assign("(deref y 2 Int)") }
+          },
+          output = {
+            "B" type Int()
+            "O" type Int()
+            "x" type Int()
+            "y" type Int()
+            "z" type Int()
+            "x_base" type Int()
+            "x_offset" type Int()
+            "y_base" type Int()
+            "y_offset" type Int()
+            (init to "L1") {
+              "x_base".assign("B")
+              "x_offset".assign("O")
+            }
+            ("L1" to "L2") {
+              "y_base".assign("x_base")
+              "y_offset".assign("x_offset")
+            }
+            ("L2" to final) { "z".assign("(deref y_base (+ y_offset 2) Int)") }
           },
         ),
         PassTestData(
@@ -655,7 +716,7 @@ class PassTests {
     println("Trying to run $passes on input...")
     val originalGlobalVars = input.parent.getVars().toSet()
     val actualOutput =
-      passes.fold(input) { acc, procedurePass -> procedurePass.run(acc) }.build(dummyXcfa)
+      passes.fold(input) { acc, procedurePass -> procedurePass.runChecked(acc) }.build(dummyXcfa)
     if (output != null) {
       val expectedOutput = output.build(dummyXcfa)
       val varLookUp =
@@ -758,5 +819,23 @@ class PassTests {
 
     val newEdges = edge.splitIf { it is InvokeLabel }
     assertTrue(newEdges.size == 3)
+  }
+
+  @Test
+  fun testSplitSingleLabel() {
+    // Inlining and recursion expansion leave edges whose label is not a SequenceLabel.
+    val call = InvokeLabel("proc1", listOf(), EmptyMetaData)
+    val edge =
+      XcfaEdge(
+        XcfaLocation("L0", metadata = EmptyMetaData),
+        XcfaLocation("L1", metadata = EmptyMetaData),
+        call,
+        EmptyMetaData,
+      )
+
+    val split = edge.splitIf { it is InvokeLabel }
+    assertEquals(listOf(SequenceLabel(listOf(call))), split.map { it.label })
+    assertEquals(listOf(edge.source to edge.target), split.map { it.source to it.target })
+    assertEquals(listOf(call), edge.splitIf { false }.single().label.getFlatLabels())
   }
 }

@@ -16,6 +16,7 @@
 package hu.bme.mit.theta.xcfa.analysis.oc
 
 import hu.bme.mit.theta.analysis.algorithm.oc.Relation
+import hu.bme.mit.theta.core.decl.IndexedConstDecl
 import hu.bme.mit.theta.core.decl.VarDecl
 import hu.bme.mit.theta.core.type.Expr
 import hu.bme.mit.theta.core.type.booltype.BoolExprs
@@ -64,6 +65,8 @@ internal data class Violation(
   val lastEvents: List<XcfaEvent>,
 )
 
+internal data class UnrollExit(val key: String, val pid: Int, val guard: Expr<BoolType>)
+
 @ConsistentCopyVisibility
 internal data class Thread
 private constructor(
@@ -84,6 +87,11 @@ private constructor(
     private var cnt: Int = 0
 
     fun uniqueId(): Int = cnt++
+
+    // the trace extractor expects the main thread at pid 0
+    fun resetIds() {
+      cnt = 0
+    }
 
     fun of(
       procedure: XcfaProcedure,
@@ -111,6 +119,7 @@ internal data class SearchItem(val loc: XcfaLocation) {
   val guards: MutableList<Set<Expr<BoolType>>> = mutableListOf()
   val lastEvents: MutableList<XcfaEvent> = mutableListOf()
   val lastWrites: MutableList<Map<VarDecl<*>, Set<XcfaEvent>>> = mutableListOf()
+  val localValues: MutableList<Map<VarDecl<*>, IndexedConstDecl<*>>> = mutableListOf()
   val threadLookups: MutableList<Map<VarDecl<*>, Set<Pair<Set<Expr<BoolType>>, Thread>>>> =
     mutableListOf()
   val atomics: MutableList<Int?> = mutableListOf()

@@ -1,5 +1,5 @@
 /*
- *  Copyright 2025 Budapest University of Technology and Economics
+ *  Copyright 2026 Budapest University of Technology and Economics
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -23,16 +23,31 @@ import hu.bme.mit.theta.core.type.Expr
 import hu.bme.mit.theta.core.type.LitExpr
 import hu.bme.mit.theta.core.type.abstracttype.AbstractExprs.Eq
 import hu.bme.mit.theta.core.type.booltype.BoolType
+import hu.bme.mit.theta.solver.SolverFactory
+import hu.bme.mit.theta.solver.javasmt.JavaSMTSolverFactory
+import hu.bme.mit.theta.xcfa.ErrorDetection
+import hu.bme.mit.theta.xcfa.ErrorDetection.DATA_RACE
+import hu.bme.mit.theta.xcfa.ErrorDetection.ERROR_LOCATION
+import hu.bme.mit.theta.xcfa.analysis.oc.XcfaOcMemoryConsistencyModel.SC
 import hu.bme.mit.theta.xcfa.model.XcfaEdge
+import org.sosy_lab.java_smt.SolverContextFactory.Solvers.Z3
 
 @Suppress("unused")
 enum class OcDecisionProcedureType(
-  internal val checker: (String, XcfaOcMemoryConsistencyModel) -> OcChecker<E>
+  internal val checker: (SolverFactory, XcfaOcMemoryConsistencyModel) -> OcChecker<E>,
+  internal val supportsProperty: (ErrorDetection, XcfaOcMemoryConsistencyModel) -> Boolean,
 ) {
 
-  IDL({ solver, mcm -> IDLOcChecker(solver, mcm == XcfaOcMemoryConsistencyModel.SC) }),
-  BASIC({ solver, _ -> BasicOcChecker(solver) }),
-  PROPAGATOR({ _, _ -> UserPropagatorOcChecker() }),
+  IDL(
+    { solver, mcm -> IDLOcChecker(solver, mcm == SC) },
+    { property, mcm -> property == ERROR_LOCATION || (property == DATA_RACE && mcm == SC) },
+  ),
+  BASIC({ solver, _ -> BasicOcChecker(solver) }, { property, _ -> property == ERROR_LOCATION }),
+  // The propagator API is implemented by JavaSMT; the CLI requires `Z3:new` for this procedure.
+  PROPAGATOR(
+    { _, _ -> UserPropagatorOcChecker(JavaSMTSolverFactory.create(Z3, arrayOf())) },
+    { property, _ -> property == ERROR_LOCATION },
+  ),
 }
 
 internal class XcfaEvent(
@@ -52,6 +67,10 @@ internal class XcfaEvent(
   private var arrayLit: LitExpr<*>? = null
   private var offsetLit: LitExpr<*>? = null
 
+  var inAtomicBlock: Boolean = false
+
+  var raceCandidate: Boolean = false
+
   init {
     check((array == null && offset == null) || (array != null && offset != null)) {
       "Array and offset expressions must be both null or both non-null."
@@ -69,7 +88,14 @@ internal class XcfaEvent(
 
     internal fun uniqueClkId(): Int = clkCnt++
 
-    internal var memoryGarbage: IndexedConstDecl<*>? = null
+    internal fun resetIds() {
+      idCnt = 0
+      clkCnt = 0
+      resetClkSize()
+    }
+
+    /** The unconstrained initial write of each memory partition (see `XcfaToEventGraph`). */
+    internal var memoryGarbages: Set<IndexedConstDecl<*>> = setOf()
   }
 
   // A (memory) event is only considered enabled if the array and offset expressions are also known
@@ -94,15 +120,17 @@ internal class XcfaEvent(
   override fun sameMemory(other: Event): Boolean {
     other as XcfaEvent
     if (!super.sameMemory(other)) return false
-    if (const == memoryGarbage || other.const == memoryGarbage) return true
+    // (the partition is already known to be the same: super compares the declarations)
+    if (const in memoryGarbages || other.const in memoryGarbages) return true
     if (arrayLit != other.arrayLit) return false
     if (offsetLit != other.offsetLit) return false
     return potentialSameMemory(other)
   }
 
-  fun potentialSameMemory(other: XcfaEvent): Boolean {
+  override fun potentialSameMemory(other: Event): Boolean {
+    other as XcfaEvent
     if (!super.sameMemory(other)) return false
-    if (const == memoryGarbage || other.const == memoryGarbage) return true
+    if (const in memoryGarbages || other.const in memoryGarbages) return true
     if (arrayStatic != null && other.arrayStatic != null && arrayStatic != other.arrayStatic)
       return false
     if (offsetStatic != null && other.offsetStatic != null && offsetStatic != other.offsetStatic)

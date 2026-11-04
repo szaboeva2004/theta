@@ -118,13 +118,19 @@ fun XCFA.getPointsToGraph(initEdges: Set<XcfaEdge> = setOf()): Map<VarDecl<*>, S
               val calledProc = this.procedures.find { proc -> proc.name == it.name }
               calledProc?.let { calledProc ->
                 calledProc.params
-                  .filter { it.second != ParamDirection.OUT }
-                  .mapIndexed { i, (param, _) ->
+                  .withIndex()
+                  .filter { (_, it) -> it.second != ParamDirection.OUT }
+                  .map { (i, pair) ->
+                    val (param, _) = pair
                     Assign(cast(param, param.type), cast(it.params[i], param.type))
                   } +
                   calledProc.params
-                    .filter { it.second != ParamDirection.IN }
-                    .mapIndexed { i, (param, _) ->
+                    .withIndex()
+                    .filter { (i, pair) ->
+                      pair.second != ParamDirection.IN && it.params[i] is RefExpr<*>
+                    }
+                    .map { (i, pair) ->
+                      val (param, _) = pair
                       Assign(
                         cast((it.params[i] as RefExpr<*>).decl as VarDecl<*>, param.type),
                         cast(param.ref, param.type),
@@ -206,20 +212,16 @@ fun VarAccessMap.pointsTo(xcfa: XCFA) = keys.pointsTo(xcfa)
  * with their points-to sets, and taking their Cartesian product.
  */
 fun Expr<*>.pointsTo(xcfa: XCFA): Set<LitExpr<*>>? {
+  val simplified = ExprUtils.simplify(this) as? LitExpr<*>
+  if (simplified != null) return setOf(simplified)
+
   val results = mutableSetOf<LitExpr<*>>()
-  var values = listOf<Map<Decl<*>, LitExpr<*>>>()
-  val vars = ExprUtils.getVars(this)
-  vars.forEach { v ->
-    val pts = xcfa.pointsToGraph[v] ?: return null
-    val newValues = mutableListOf<Map<Decl<*>, LitExpr<*>>>()
-    pts.forEach { lit ->
-      if (values.isEmpty()) {
-        newValues.add(mapOf(v to lit))
-      } else {
-        values.forEach { vs -> newValues.add(vs + mapOf(v to lit)) }
-      }
-    }
-    values = newValues
+  // Start from the empty valuation: an expression without variables (e.g. a read of memory) is
+  // still evaluated once, and is unknown unless it folds to a literal.
+  var values = listOf<Map<Decl<*>, LitExpr<*>>>(emptyMap())
+  ExprUtils.getVars(this).forEach { v ->
+    val pts = xcfa.pointsToGraph[v]?.takeIf { it.isNotEmpty() } ?: return null
+    values = values.flatMap { vs -> pts.map { lit -> vs + (v to lit) } }
   }
   values.forEach { vs ->
     val valuation = ImmutableValuation.from(vs)

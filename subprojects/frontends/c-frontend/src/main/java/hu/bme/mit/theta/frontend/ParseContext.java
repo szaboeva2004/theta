@@ -1,5 +1,5 @@
 /*
- *  Copyright 2025 Budapest University of Technology and Economics
+ *  Copyright 2026 Budapest University of Technology and Economics
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -17,9 +17,18 @@ package hu.bme.mit.theta.frontend;
 
 import hu.bme.mit.theta.frontend.transformation.ArchitectureConfig.ArchitectureType;
 import hu.bme.mit.theta.frontend.transformation.ArchitectureConfig.ArithmeticType;
+import hu.bme.mit.theta.frontend.transformation.ArchitectureConfig.MemoryModelType;
 import hu.bme.mit.theta.frontend.transformation.CStmtCounter;
 import hu.bme.mit.theta.frontend.transformation.grammar.preprocess.ArithmeticTrait;
+import hu.bme.mit.theta.frontend.transformation.model.types.complex.compound.CArray;
+import hu.bme.mit.theta.frontend.transformation.model.types.complex.compound.CStruct;
+import java.math.BigInteger;
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 public class ParseContext {
@@ -30,9 +39,129 @@ public class ParseContext {
     private Boolean multiThreading = false;
     private ArithmeticType arithmetic = ArithmeticType.efficient;
 
+    /**
+     * Whether {@link #arithmetic} was picked by the frontend from `efficient` rather than chosen by
+     * the caller. Only an automatic choice may be revised: if the user asked for integer arithmetic
+     * and the program turns out to need bits, that is their answer to live with, but a guess this
+     * code made is fair game to correct.
+     */
+    private boolean arithmeticAutoSelected = false;
+
+    /**
+     * Whether a solver in use divides integers only by constants (Yices): integer arithmetic cannot
+     * then encode a `/` or `%` by a variable, so `efficient` resolves to bitvectors for such a
+     * program.
+     */
+    private boolean constantIntDivisorsOnly = false;
+
+    private Boolean signedWraparound = false;
+    private MemoryModelType memoryModel = MemoryModelType.multi;
+
+    /**
+     * Whether the property being verified is a memory-safety one.
+     *
+     * <p>The frontend emits object-lifetime bookkeeping (see {@code FunctionVisitor}'s scope-end
+     * releases) that only the memory-safety checks read. Under any other property that bookkeeping
+     * would be pure cost -- and worse, an observable change to a model nothing asks a question of
+     * -- so it is gated on this. The XCFA passes read it as well, so the frontend and the
+     * memory-safety instrumentation always agree.
+     */
+    private boolean checkMemsafety = false;
+
+    /**
+     * Whether the property being verified is no-data-race: a read C never performs (the unselected
+     * operand of {@code ?:}) must then not appear in the model, or it races. Set like {@link
+     * #checkMemsafety}.
+     */
+    private boolean checkDataRace = false;
+
+    // Which cells of a memory object (keyed by its compile-time base id) are `_Atomic`, so that the
+    // data-race check can exclude accesses to them. `_Atomic` is a property of the accessed *cell*
+    // --
+    // a struct field, an array element, or what a pointer points at -- not of the pointer
+    // expression
+    // that reaches it, and that expression is a bare base-id literal by the time the analysis runs
+    // (folded constants, rebuilt exprs, identity-keyed C types all lost). The base id survives by
+    // value, so atomicity is recorded against it where the id is minted (global object layout in
+    // the
+    // frontend builder, address-taken objects in ReferenceElimination) and looked up by value here.
+    private final Set<BigInteger> fullyAtomicObjects = new LinkedHashSet<>();
+    // Which C constructs the program's own code uses, collected once by SourceTraitCollector.
+    // Diagnostics only: nothing downstream reads it, it is emitted for offline study.
+    private Map<String, Integer> sourceTraits = new LinkedHashMap<>();
+
+    private final Map<BigInteger, Set<Integer>> atomicObjectCells = new LinkedHashMap<>();
+
+    // A struct-typed field is a subobject with a base id of its own, kept in the parent's cell. So
+    // a
+    // nested access `s.i.f` reaches the atomic cell through `(deref (deref parent i) f)`: the inner
+    // dereference yields the subobject's base. This maps (parent base, field offset) -> subobject
+    // base so the race check can follow that chain to the object the atomicity is recorded against.
+    private final Map<BigInteger, Map<Integer, BigInteger>> subObjectCells = new LinkedHashMap<>();
+
+    // Compile-time base ids of global objects, mapped to the object they are a part of (if any).
+    private final Map<BigInteger, BigInteger> staticObjectParents = new LinkedHashMap<>();
+    private final Set<BigInteger> staticUnions = new LinkedHashSet<>();
+
+    private final FlatAddressSpace flatAddressSpace = new FlatAddressSpace();
+
+    // Members accessed anywhere in the program, keyed by their (structurally compared) type.
+    private final Map<CStruct, Set<String>> accessedMembers = new LinkedHashMap<>();
+    private boolean everyMemberAccessed = false;
+    private boolean aggregateMemberCopied = false;
+
+    public Map<String, Integer> getSourceTraits() {
+        return sourceTraits;
+    }
+
+    public void setSourceTraits(Map<String, Integer> sourceTraits) {
+        this.sourceTraits = sourceTraits;
+    }
+
+    public boolean isCheckMemsafety() {
+        return checkMemsafety;
+    }
+
+    public void setCheckMemsafety(boolean checkMemsafety) {
+        this.checkMemsafety = checkMemsafety;
+    }
+
+    public boolean isCheckDataRace() {
+        return checkDataRace;
+    }
+
+    public void setCheckDataRace(boolean checkDataRace) {
+        this.checkDataRace = checkDataRace;
+    }
+
     public ParseContext() {
         metadata = new FrontendMetadata();
         cStmtCounter = new CStmtCounter();
+    }
+
+    /**
+     * Starts of the C full expressions being visited, innermost first. Every {@code CStatement}
+     * built meanwhile records the innermost one, which is where a witness locates a violation
+     * inside it. An empty entry hides the enclosing ones.
+     */
+    private final Deque<Optional<SourcePosition>> fullExpressions = new ArrayDeque<>();
+
+    public void pushFullExpression(SourcePosition start) {
+        fullExpressions.push(Optional.of(start));
+    }
+
+    /** Hides the enclosing full expressions until the matching {@link #popFullExpression()}. */
+    public void pushNoFullExpression() {
+        fullExpressions.push(Optional.empty());
+    }
+
+    public void popFullExpression() {
+        fullExpressions.pop();
+    }
+
+    /** The start of the innermost full expression, empty if there is none or it is hidden. */
+    public Optional<SourcePosition> getFullExpression() {
+        return fullExpressions.isEmpty() ? Optional.empty() : fullExpressions.peek();
     }
 
     public ParseContext(
@@ -41,13 +170,15 @@ public class ParseContext {
             final Set<ArithmeticTrait> arithmeticTraits,
             final ArchitectureType architecture,
             final Boolean multiThreading,
-            final ArithmeticType arithmetic) {
+            final ArithmeticType arithmetic,
+            final Boolean signedWraparound) {
         this.metadata = metadata;
         this.cStmtCounter = cStmtCounter;
         this.arithmeticTraits = arithmeticTraits;
         this.architecture = architecture;
         this.multiThreading = multiThreading;
         this.arithmetic = arithmetic;
+        this.signedWraparound = signedWraparound;
     }
 
     public FrontendMetadata getMetadata() {
@@ -86,7 +217,170 @@ public class ParseContext {
         this.arithmetic = arithmetic;
     }
 
+    public boolean isArithmeticAutoSelected() {
+        return arithmeticAutoSelected;
+    }
+
+    public void setArithmeticAutoSelected(boolean arithmeticAutoSelected) {
+        this.arithmeticAutoSelected = arithmeticAutoSelected;
+    }
+
+    public boolean isConstantIntDivisorsOnly() {
+        return constantIntDivisorsOnly;
+    }
+
+    public void setConstantIntDivisorsOnly(boolean constantIntDivisorsOnly) {
+        this.constantIntDivisorsOnly = constantIntDivisorsOnly;
+    }
+
+    public Boolean getSignedWraparound() {
+        return signedWraparound;
+    }
+
+    public void setSignedWraparound(Boolean signedWraparound) {
+        this.signedWraparound = signedWraparound;
+    }
+
+    public MemoryModelType getMemoryModel() {
+        return memoryModel;
+    }
+
+    public void setMemoryModel(MemoryModelType memoryModel) {
+        this.memoryModel = memoryModel;
+    }
+
     public CStmtCounter getCStmtCounter() {
         return cStmtCounter;
+    }
+
+    public FlatAddressSpace getFlatAddressSpace() {
+        return flatAddressSpace;
+    }
+
+    /** Records that every cell of the object at base id [base] is `_Atomic`. */
+    public void markObjectFullyAtomic(BigInteger base) {
+        fullyAtomicObjects.add(base);
+        atomicObjectCells.remove(base); // fully-atomic subsumes any per-cell record
+    }
+
+    /** Records that the cell at unit offset [unitOffset] within object [base] is `_Atomic`. */
+    public void markObjectAtomicCell(BigInteger base, int unitOffset) {
+        if (fullyAtomicObjects.contains(base)) {
+            return;
+        }
+        atomicObjectCells.computeIfAbsent(base, k -> new LinkedHashSet<>()).add(unitOffset);
+    }
+
+    /**
+     * Whether the cell at [unitOffset] (null when the offset is not a compile-time constant) within
+     * the object at base id [base] is `_Atomic`. A fully-atomic object answers true for any offset.
+     */
+    public boolean isAtomicObjectCell(BigInteger base, Integer unitOffset) {
+        if (fullyAtomicObjects.contains(base)) {
+            return true;
+        }
+        if (unitOffset == null) {
+            return false;
+        }
+        Set<Integer> offsets = atomicObjectCells.get(base);
+        return offsets != null && offsets.contains(unitOffset);
+    }
+
+    /**
+     * Records that cell [unitOffset] of object [parentBase] holds the base id of subobject
+     * [subBase].
+     */
+    public void recordSubObjectCell(BigInteger parentBase, int unitOffset, BigInteger subBase) {
+        subObjectCells
+                .computeIfAbsent(parentBase, k -> new LinkedHashMap<>())
+                .put(unitOffset, subBase);
+    }
+
+    /**
+     * The base id of the subobject held in cell [unitOffset] of object [parentBase], or null when
+     * no subobject is recorded there.
+     */
+    public BigInteger subObjectBaseAt(BigInteger parentBase, Integer unitOffset) {
+        if (unitOffset == null) {
+            return null;
+        }
+        Map<Integer, BigInteger> cells = subObjectCells.get(parentBase);
+        return cells == null ? null : cells.get(unitOffset);
+    }
+
+    /**
+     * Records that [base] is the compile-time base id of a global object, stored within the object
+     * [parent] (null for a top-level object).
+     */
+    public void recordStaticObject(BigInteger base, boolean union, BigInteger parent) {
+        staticObjectParents.put(base, parent);
+        if (union) {
+            staticUnions.add(base);
+        }
+    }
+
+    public boolean isStaticObject(BigInteger base) {
+        return staticObjectParents.containsKey(base);
+    }
+
+    /** Records that member [member] of [type] is accessed somewhere in the program. */
+    public void markMemberAccessed(CStruct type, String member) {
+        accessedMembers.computeIfAbsent(type, k -> new LinkedHashSet<>()).add(member);
+    }
+
+    /** Records that an access could not be attributed to a type, so every member may be read. */
+    public void markEveryMemberAccessed() {
+        everyMemberAccessed = true;
+    }
+
+    public boolean isMemberAccessed(CStruct type, String member) {
+        final Set<String> members = accessedMembers.get(type);
+        return everyMemberAccessed || (members != null && members.contains(member));
+    }
+
+    public boolean isAnyMemberAccessed(CStruct type) {
+        return everyMemberAccessed || accessedMembers.containsKey(type);
+    }
+
+    /** Records that a struct holding an aggregate member is copied member by member. */
+    public void markAggregateMemberCopied() {
+        aggregateMemberCopied = true;
+    }
+
+    /**
+     * Whether a struct, union or array member is accessed or copied anywhere: the only ways a
+     * sub-object held in a parent's cell is reached.
+     */
+    public boolean isAggregateMemberUsed() {
+        if (everyMemberAccessed || aggregateMemberCopied) {
+            return true;
+        }
+        return accessedMembers.entrySet().stream()
+                .anyMatch(
+                        entry ->
+                                entry.getKey().getFields().stream()
+                                        .anyMatch(
+                                                field ->
+                                                        entry.getValue().contains(field.get1())
+                                                                && (field.get2() instanceof CStruct
+                                                                        || field.get2()
+                                                                                instanceof
+                                                                                CArray)));
+    }
+
+    /**
+     * The outermost union the static object [base] is a part of (itself included), or null when
+     * there is none.
+     */
+    public BigInteger enclosingStaticUnion(BigInteger base) {
+        BigInteger union = null;
+        for (BigInteger current = base;
+                current != null;
+                current = staticObjectParents.get(current)) {
+            if (staticUnions.contains(current)) {
+                union = current;
+            }
+        }
+        return union;
     }
 }

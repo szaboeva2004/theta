@@ -1,5 +1,5 @@
 /*
- *  Copyright 2025 Budapest University of Technology and Economics
+ *  Copyright 2026 Budapest University of Technology and Economics
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 package hu.bme.mit.theta.xcfa.analysis.por
 
 import hu.bme.mit.theta.analysis.LTS
+import hu.bme.mit.theta.analysis.State
 import hu.bme.mit.theta.analysis.expl.ExplState
 import hu.bme.mit.theta.analysis.expr.ExprState
 import hu.bme.mit.theta.analysis.ptr.PtrState
@@ -51,16 +52,15 @@ internal fun MemLoc.isLit() = first is LitExpr<*> && second is LitExpr<*>
  *
  * @param xcfa the XCFA of the verified program
  */
-open class XcfaSporLts(protected val xcfa: XCFA) :
+open class XcfaSporLts(protected val xcfa: XCFA, private val random: Random) :
   LTS<XcfaState<out PtrState<out ExprState>>, XcfaAction> {
 
   companion object {
 
     private val dependencySolver: Solver by lazy { Z3SolverFactory.getInstance().createSolver() }
-    var random: Random = Random.Default
   }
 
-  protected var simpleXcfaLts = getXcfaLts()
+  protected var simpleXcfaLts = getXcfaLts(random)
 
   /* CACHE COLLECTIONS */
 
@@ -78,9 +78,6 @@ open class XcfaSporLts(protected val xcfa: XCFA) :
 
   /** Backward edges in the CFA (an edge of a loop). */
   private val backwardEdges: MutableSet<Pair<XcfaLocation, XcfaLocation>> = mutableSetOf()
-
-  /** Variables of mutex handles (VarDecls in FenceLabels), needed for AASPOR. */
-  protected val fenceVars: MutableSet<VarDecl<*>> = mutableSetOf()
 
   init {
     collectBackwardEdges()
@@ -158,11 +155,23 @@ open class XcfaSporLts(protected val xcfa: XCFA) :
       }
     disabledOutEdges.forEach { edge ->
       edge.getFlatLabels().filterIsInstance<FenceLabel>().forEach { fence ->
-        fence.blockingMutexes.forEach { mutex ->
-          state.mutexes[mutex.name]?.forEach { pid2 ->
-            if (pid2 !in firstProcesses) {
-              firstProcesses.add(pid2)
-              checkMutexBlocks(state, pid2, firstProcesses, enabledActionsByProcess)
+        fence.blockingMutexes(state).forEach { mutex ->
+          if (!mutex.isKnown() || state.mutexes.keys.any { !it.isKnown() }) {
+            state.mutexes.values
+              .flatMap { it.keys }
+              .toSet()
+              .forEach { pid2 ->
+                if (pid2 !in firstProcesses) {
+                  firstProcesses.add(pid2)
+                  checkMutexBlocks(state, pid2, firstProcesses, enabledActionsByProcess)
+                }
+              }
+          } else {
+            state.mutexes[mutex]?.keys?.forEach { pid2 ->
+              if (pid2 !in firstProcesses) {
+                firstProcesses.add(pid2)
+                checkMutexBlocks(state, pid2, firstProcesses, enabledActionsByProcess)
+              }
             }
           }
         }
@@ -186,28 +195,64 @@ open class XcfaSporLts(protected val xcfa: XCFA) :
       return enabledActions.toSet()
     }
     val sourceSet = firstActions.toMutableSet()
+    val firstActionPids = firstActions.map { it.pid }.toSet()
+    // blocked actions with their blocking pids associated
+    val edgesBlockedByOtherThreads: Map<XcfaAction, Set<Int>> =
+      state.processes
+        .filter { enabledActions.none { action -> action.pid == it.key } }
+        .flatMap { (pid, processState) ->
+          processState.locs.peek().outgoingEdges.mapNotNull { edge ->
+            val blockingPids =
+              edge
+                .getFlatLabels()
+                .flatMap { label ->
+                  (label as? FenceLabel)?.blockingMutexes(state)?.flatMap { mutex ->
+                    state.mutexes[mutex]?.keys?.filter { it != pid && it !in firstActionPids }
+                      ?: emptyList()
+                  } ?: emptyList()
+                }
+                .toSet()
+            if (blockingPids.isEmpty()) null else XcfaAction(pid, edge) to blockingPids
+          }
+        }
+        .toMap()
     val otherActions =
-      (enabledActions.toMutableSet() subtract sourceSet)
+      ((enabledActions.toSet() union edgesBlockedByOtherThreads.keys) subtract sourceSet)
         .toMutableSet() // actions not in the source set
     var addedNewAction = true
     while (addedNewAction) {
       addedNewAction = false
-      val actionsToRemove = mutableSetOf<XcfaAction>()
-      for (action in otherActions) {
+      val remaining = otherActions.toMutableSet()
+      while (remaining.isNotEmpty()) {
+        val otherAction = remaining.first()
+        remaining.remove(otherAction)
         // for every action that is not in the source set it is checked whether it should be added
         // to the source set
         // (because it is dependent with an action already in the source set)
-        if (sourceSet.any { dependent(state, it, action) }) {
-          if (action.isBackward) {
-            return enabledActions
-              .toSet() // see POR algorithm for the reason of handling backward edges this way
+        if (sourceSet.any { dependent(state, it, otherAction) }) {
+          if (otherAction.isBackward) {
+            // see POR algorithm cycle condition for the reason of handling backward edges this way
+            return enabledActions.toSet()
           }
-          sourceSet.add(action)
-          actionsToRemove.add(action)
-          addedNewAction = true
+
+          val blockingPids = edgesBlockedByOtherThreads[otherAction] ?: emptySet()
+          if (blockingPids.isEmpty()) {
+            // if no blocking processes are found, add the action directly to the source set
+            addedNewAction = sourceSet.add(otherAction) || addedNewAction
+            edgesBlockedByOtherThreads.forEach { (action, blockingPids) ->
+              if (blockingPids == setOf(otherAction.pid)) {
+                otherActions.remove(action)
+              }
+            }
+          } else {
+            // otherwise, add the blocking actions
+            val blockingActions = enabledActions.filter { it.pid in blockingPids }.toSet()
+            addedNewAction = sourceSet.addAll(blockingActions) || addedNewAction
+            otherActions.removeAll(blockingActions)
+          }
+          otherActions.remove(otherAction)
         }
       }
-      actionsToRemove.forEach(otherActions::remove)
     }
     return sourceSet
   }
@@ -227,9 +272,13 @@ open class XcfaSporLts(protected val xcfa: XCFA) :
   ): Boolean {
     if (sourceSetAction.pid == action.pid) return true
 
-    val sourceSetActionVars = getCachedUsedVars(getEdge(sourceSetAction))
+    val sourceSetActionVars = getCachedUsedVars(getEdge(sourceSetAction), state)
     val influencedVars = getInfluencedVars(getEdge(action))
+
+    // shared variable
     if ((influencedVars intersect sourceSetActionVars).isNotEmpty()) return true
+
+    // shared mutex use
 
     val sourceSetMemLocs = getCachedMemLocs(getEdge(sourceSetAction))
     val influencedMemLocs = getInfluencedMemLocs(getEdge(action))
@@ -323,15 +372,10 @@ open class XcfaSporLts(protected val xcfa: XCFA) :
    */
   private fun getDirectlyUsedVars(edge: XcfaEdge): Set<VarDecl<*>> {
     val globalVars = xcfa.globalVars.map(XcfaGlobalVar::wrappedVar)
-    fenceVars.addAll(edge.fenceVars)
     return edge
       .getFlatLabels()
       .flatMap { label -> label.collectVars().filter { it in globalVars } }
-      .toSet() union
-      edge.acquiredEmbeddedFenceVars.let { mutexes ->
-        fenceVars.addAll(mutexes)
-        if (mutexes.size <= 1) setOf() else mutexes
-      }
+      .toSet() union edge.acquiredEmbeddedMutexes.flatMap { ExprUtils.getVars(it.lock) }
   }
 
   /**
@@ -354,16 +398,16 @@ open class XcfaSporLts(protected val xcfa: XCFA) :
    * @param edge whose global variables are to be returned
    * @return the set of directly or indirectly used global variables
    */
-  protected fun getCachedUsedVars(edge: XcfaEdge): Set<VarDecl<*>> {
+  protected fun getCachedUsedVars(edge: XcfaEdge, state: State): Set<VarDecl<*>> {
     if (edge in usedVars) return usedVars[edge]!!
     val flatLabels = edge.getFlatLabels()
     val mutexes =
-      flatLabels.filterIsInstance<FenceLabel>().flatMap { it.acquiredMutexes }.toMutableSet()
+      flatLabels.filterIsInstance<FenceLabel>().flatMap { it.acquiredMutexes(state) }.toMutableSet()
     val vars =
       if (mutexes.isEmpty()) {
         getDirectlyUsedVars(edge)
       } else {
-        getVarsWithBFS(edge) { it.mutexOperations(mutexes) }.toSet()
+        getVarsWithBFS(edge) { it.mutexOperations(mutexes) }
       }
     usedVars[edge] = vars
     return vars

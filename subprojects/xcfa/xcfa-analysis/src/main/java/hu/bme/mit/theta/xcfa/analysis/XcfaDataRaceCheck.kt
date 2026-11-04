@@ -15,22 +15,38 @@
  */
 package hu.bme.mit.theta.xcfa.analysis
 
+import hu.bme.mit.theta.analysis.State
 import hu.bme.mit.theta.analysis.Trace
 import hu.bme.mit.theta.analysis.expl.ExplState
 import hu.bme.mit.theta.analysis.expr.ExprState
 import hu.bme.mit.theta.analysis.expr.refinement.ExprTraceChecker
 import hu.bme.mit.theta.analysis.expr.refinement.Refutation
 import hu.bme.mit.theta.analysis.ptr.PtrState
+import hu.bme.mit.theta.analysis.ptr.repatch
+import hu.bme.mit.theta.common.exception.NotSolvableException
+import hu.bme.mit.theta.core.decl.Decl
 import hu.bme.mit.theta.core.decl.VarDecl
 import hu.bme.mit.theta.core.stmt.AssumeStmt
+import hu.bme.mit.theta.core.stmt.SkipStmt
+import hu.bme.mit.theta.core.stmt.Stmt
 import hu.bme.mit.theta.core.type.Expr
+import hu.bme.mit.theta.core.type.LitExpr
+import hu.bme.mit.theta.core.type.Type
 import hu.bme.mit.theta.core.type.abstracttype.AbstractExprs.Eq
+import hu.bme.mit.theta.core.type.abstracttype.NeqExpr
+import hu.bme.mit.theta.core.type.anytype.Dereference
 import hu.bme.mit.theta.core.type.anytype.RefExpr
 import hu.bme.mit.theta.core.type.booltype.BoolExprs.And
+import hu.bme.mit.theta.core.type.booltype.BoolExprs.False
 import hu.bme.mit.theta.core.type.booltype.BoolExprs.True
 import hu.bme.mit.theta.core.type.booltype.BoolType
+import hu.bme.mit.theta.core.type.inttype.IntExprs.Int
 import hu.bme.mit.theta.core.utils.ExprUtils
 import hu.bme.mit.theta.core.utils.PathUtils
+import hu.bme.mit.theta.core.utils.StmtUtils
+import hu.bme.mit.theta.core.utils.indexings.VarIndexing
+import hu.bme.mit.theta.core.utils.indexings.VarIndexingFactory
+import hu.bme.mit.theta.frontend.ParseContext
 import hu.bme.mit.theta.solver.Solver
 import hu.bme.mit.theta.solver.utils.WithPushPop
 import hu.bme.mit.theta.solver.z3.Z3SolverFactory
@@ -39,6 +55,9 @@ import hu.bme.mit.theta.xcfa.XcfaProperty
 import hu.bme.mit.theta.xcfa.model.*
 import hu.bme.mit.theta.xcfa.passes.changeVars
 import hu.bme.mit.theta.xcfa.utils.*
+import hu.bme.mit.theta.xcfa.utils.getFlatLabels
+import kotlin.collections.component1
+import kotlin.collections.component2
 
 private val dependencySolver: Solver by lazy { Z3SolverFactory.getInstance().createSolver() }
 
@@ -46,22 +65,46 @@ private val dependencySolver: Solver by lazy { Z3SolverFactory.getInstance().cre
 data class DataRaceAccess(val pid: Int, val edge: XcfaEdge, val label: XcfaLabel)
 
 /**
- * A pair of conflicting accesses constituting a data race. The `condition` is the extra path
- * condition under which the two accesses conflict (the aliasing condition for memory accesses;
- * [True] for plain global variable races).
+ * A pair of conflicting accesses constituting a data race. [condition] is the extra path condition
+ * under which the two accesses actually alias -- the aliasing condition for memory accesses, [True]
+ * for a plain global-variable race. It holds after [prefix1] and [prefix2], the statements the two
+ * labels execute before the accesses, which may assign the variables the condition reads.
  */
 data class DataRace(
   val access1: DataRaceAccess,
   val access2: DataRaceAccess,
   val condition: Expr<BoolType>,
-)
+  val prefix1: List<Stmt> = listOf(),
+  val prefix2: List<Stmt> = listOf(),
+) {
+  /** Whether [condition] can be checked in the state before the two labels. */
+  val exact: Boolean
+    get() = prefix1.isEmpty() && prefix2.isEmpty()
+
+  /**
+   * Runs both prefixes, in either order (both are real interleavings), then assumes [condition].
+   */
+  fun conditionLabel(): XcfaLabel {
+    fun seq(stmts: List<Stmt>) =
+      SequenceLabel(stmts.map { StmtLabel(it) } + StmtLabel(AssumeStmt.of(condition)))
+    return if (prefix1.isEmpty() || prefix2.isEmpty()) seq(prefix1 + prefix2)
+    else NondetLabel(setOf(seq(prefix1 + prefix2), seq(prefix2 + prefix1)))
+  }
+}
 
 /**
- * Finds a pair of conflicting accesses (same location, different processes, at least one write, not
- * both atomic, not mutually excluded) enabled after the given state, or returns null if no data
- * race is possible.
+ * Finds every pair of conflicting accesses (same location, different processes, at least one write,
+ * not both atomic, not mutually excluded) that may be enabled after [s].
+ *
+ * A [DataRace] carries the racing edges and labels the concurrent-witness writer needs, and the
+ * condition the trace-checker wrapper asserts. `_Atomic` accesses are excluded here (via
+ * [parseContext]), so all consumers stay atomic-aware.
  */
-fun findDataRace(s: XcfaState<out PtrState<out ExprState>>): DataRace? {
+fun findDataRaces(
+  s: XcfaState<out PtrState<out ExprState>>,
+  parseContext: ParseContext,
+): Sequence<DataRace> = sequence {
+  if (s.isBottom) return@sequence
   val xcfa = s.xcfa!!
   val processes = s.processes.entries.toList()
   for (i in processes.indices) {
@@ -76,37 +119,51 @@ fun findDataRace(s: XcfaState<out PtrState<out ExprState>>): DataRace? {
           val mutexes1 = s.mutexes.filterValues { process1.key in it }.keys
           val mutexes2 = s.mutexes.filterValues { process2.key in it }.keys
 
-          val globals1 = label1.getGlobalVarsWithNeededMutexes(xcfa, mutexes1)
-          val globals2 = label2.getGlobalVarsWithNeededMutexes(xcfa, mutexes2)
+          val globals1 = label1.getGlobalVarsWithNeededMutexes(xcfa, mutexes1, s)
+          val globals2 = label2.getGlobalVarsWithNeededMutexes(xcfa, mutexes2, s)
           for (v1 in globals1) {
             for (v2 in globals2) {
               if (
                 v1.globalVar == v2.globalVar &&
                   !v1.globalVar.atomic &&
                   (v1.access.isWritten || v2.access.isWritten) &&
-                  canExecuteConcurrently(v1, v2)
+                  mayExecuteConcurrently(v1, v2)
               )
-                return DataRace(
-                  DataRaceAccess(process1.key, edge1, v1.label),
-                  DataRaceAccess(process2.key, edge2, v2.label),
-                  True(),
+                yield(
+                  DataRace(
+                    DataRaceAccess(process1.key, edge1, v1.label),
+                    DataRaceAccess(process2.key, edge2, v2.label),
+                    concurrentExecutionCondition(v1, v2),
+                    v1.precedingStatements,
+                    v2.precedingStatements,
+                  )
                 )
             }
           }
 
-          val mems1 = label1.getMemoryAccessesWithMutexes(mutexes1)
-          val mems2 = label2.getMemoryAccessesWithMutexes(mutexes2)
+          val mems1 = label1.getMemoryAccessesWithMutexes(mutexes1, xcfa, parseContext, s)
+          val mems2 = label2.getMemoryAccessesWithMutexes(mutexes2, xcfa, parseContext, s)
           for (m1 in mems1) {
             for (m2 in mems2) {
               if (
                 (m1.access.isWritten || m2.access.isWritten) &&
-                  canExecuteConcurrently(m1, m2) &&
-                  mayBeSameMemoryLocation(m1.array, m1.offset, m2.array, m2.offset, s)
+                  !m1.atomic &&
+                  !m2.atomic &&
+                  mayExecuteConcurrently(m1, m2) &&
+                  mayBeSameMemoryLocation(m1, m2, s)
               ) {
-                return DataRace(
-                  DataRaceAccess(process1.key, edge1, m1.label),
-                  DataRaceAccess(process2.key, edge2, m2.label),
-                  And(Eq(m1.array, m2.array), Eq(m1.offset, m2.offset)),
+                yield(
+                  DataRace(
+                    DataRaceAccess(process1.key, edge1, m1.label),
+                    DataRaceAccess(process2.key, edge2, m2.label),
+                    And(
+                      concurrentExecutionCondition(m1, m2),
+                      Eq(m1.array, m2.array),
+                      Eq(m1.offset, m2.offset),
+                    ),
+                    m1.precedingStatements,
+                    m2.precedingStatements,
+                  )
                 )
               }
             }
@@ -115,90 +172,136 @@ fun findDataRace(s: XcfaState<out PtrState<out ExprState>>): DataRace? {
       }
     }
   }
-  return null
 }
 
+/** The first of [findDataRaces], or null if no data race is possible after [s]. */
+fun findDataRace(s: XcfaState<out PtrState<out ExprState>>, parseContext: ParseContext): DataRace? =
+  findDataRaces(s, parseContext).firstOrNull()
+
 /** Returns a predicate that checks whether data race is possible after the given state. */
-fun getDataRaceDetector() =
+fun getDataRaceDetector(parseContext: ParseContext) =
   object : XcfaErrorDetector {
 
-    override fun test(s: XcfaState<out PtrState<out ExprState>>): Boolean = findDataRace(s) != null
+    override fun test(s: XcfaState<out PtrState<out ExprState>>): Boolean =
+      findDataRace(s, parseContext) != null
 
     override fun <T : Refutation> exprTraceCheckerWrapper(
       exprTraceChecker: ExprTraceChecker<T>
-    ): ExprTraceChecker<T> = wrapExprTraceCheckerWithDataRaceCondition(exprTraceChecker)
+    ): ExprTraceChecker<T> =
+      wrapExprTraceCheckerWithDataRaceCondition(exprTraceChecker, parseContext)
   }
 
+/**
+ * Wraps [exprTraceChecker] so that, before it checks a trace, the aliasing condition of the data
+ * race enabled in the trace's last state is asserted on the last action -- turning a "the accesses
+ * *may* alias" abstraction into the concrete race the refinement must respect.
+ */
 fun <T : Refutation> wrapExprTraceCheckerWithDataRaceCondition(
-  exprTraceChecker: ExprTraceChecker<T>
+  exprTraceChecker: ExprTraceChecker<T>,
+  parseContext: ParseContext,
 ): ExprTraceChecker<T> = ExprTraceChecker { trace ->
-  val t =
-    if (
-      trace.states.isEmpty() ||
-        trace.actions.isEmpty() ||
-        trace.states.last() !is XcfaState<*> ||
-        trace.actions.last() !is XcfaAction
-    ) {
-      trace
-    } else {
-      val lastState = trace.states.last() as XcfaState<out PtrState<out ExprState>>
-      findDataRace(lastState)?.condition?.let { extraAssumption ->
-        Trace.of(
-          trace.states,
-          trace.actions.subList(0, trace.actions.size - 1) +
-            trace.actions.last().let {
-              (it as XcfaAction).withLabel(
-                SequenceLabel(listOf(it.label, StmtLabel(AssumeStmt.of(extraAssumption))))
-              )
-            },
-        )
-      } ?: trace
+  if (
+    trace.states.isEmpty() ||
+      trace.actions.isEmpty() ||
+      trace.states.last() !is XcfaState<*> ||
+      trace.actions.last() !is XcfaAction
+  ) {
+    return@ExprTraceChecker exprTraceChecker.check(trace)
+  }
+  val lastState = trace.states.last() as XcfaState<out PtrState<out ExprState>>
+  val races = findDataRaces(lastState, parseContext).toList()
+  if (races.isEmpty()) return@ExprTraceChecker exprTraceChecker.check(trace)
+
+  fun withLastLabel(extra: XcfaLabel) =
+    Trace.of(
+      trace.states,
+      trace.actions.subList(0, trace.actions.size - 1) +
+        trace.actions.last().let {
+          (it as XcfaAction).withLabel(SequenceLabel(listOf(it.label, extra)))
+        },
+    )
+
+  val exactRace = races.firstOrNull { it.exact }
+  if (exactRace != null) {
+    exprTraceChecker.check(withLastLabel(StmtLabel(AssumeStmt.of(exactRace.condition))))
+  } else {
+    // Every candidate's addresses are only known after statements of its own label. A refuted trace
+    // here would mark a reachable state infeasible, hiding any race after it, so only a confirmed
+    // race is reported and the analysis gives up otherwise.
+    val conditions = races.map { it.conditionLabel() }.toSet()
+    val status =
+      exprTraceChecker.check(withLastLabel(conditions.singleOrNull() ?: NondetLabel(conditions)))
+    if (status.isInfeasible) {
+      throw NotSolvableException()
     }
-  exprTraceChecker.check(t)
+    status
+  }
 }
 
+/** Applies [wrapExprTraceCheckerWithDataRaceCondition] only when the property is a data race. */
 fun <T : Refutation> wrapExprTraceCheckerWithDataRaceCondition(
-  property: XcfaProperty? = null
+  property: XcfaProperty?,
+  parseContext: ParseContext,
 ): (ExprTraceChecker<T>) -> ExprTraceChecker<T> =
   if (property?.verifiedProperty == ErrorDetection.DATA_RACE) {
-    { wrapExprTraceCheckerWithDataRaceCondition(it) }
+    { wrapExprTraceCheckerWithDataRaceCondition(it, parseContext) }
   } else {
     { it }
   }
 
 private sealed class GlobalAccessWithMutexes(
+  /** The (flat) label the access was found in -- the concurrent-witness writer reports it. */
   val label: XcfaLabel,
   val access: AccessType,
-  val acquiredMutexes: Set<String>,
-  val blockingMutexes: Set<String>,
-)
+  val acquiredMutexes: Set<MutexLock>,
+  val blockingMutexes: Set<MutexLock>,
+  val precedingStatements: List<Stmt>,
+) {
+  val precondition: Expr<BoolType>
+  val finalIndexing: VarIndexing
+
+  init {
+    val unfolded = StmtUtils.toExpr(precedingStatements, VarIndexingFactory.indexing(0))
+    precondition = And(unfolded.exprs)
+    finalIndexing = unfolded.indexing
+  }
+}
 
 /**
- * Represents a global variable access: stores the accessing label, the variable declaration, the
- * access type (read/write) and the set of acquired/blocking mutexes for performing the variable
- * access.
+ * Represents a global variable access: stores the variable declaration, the access type
+ * (read/write) and the set of acquired/blocking mutexes for performing the variable access.
  */
 private class GlobalVarAccessWithMutexes(
   val globalVar: XcfaGlobalVar,
   label: XcfaLabel,
   access: AccessType,
-  acquiredMutexes: Set<String>,
-  blockingMutexes: Set<String>,
-) : GlobalAccessWithMutexes(label, access, acquiredMutexes, blockingMutexes)
+  acquiredMutexes: Set<MutexLock>,
+  blockingMutexes: Set<MutexLock>,
+  precedingStmts: List<Stmt>,
+) : GlobalAccessWithMutexes(label, access, acquiredMutexes, blockingMutexes, precedingStmts)
 
 /**
- * Represents a memory access: stores the accessing label, the array expression, the offset
- * expression, the access type (read/write) and the set of acquired/blocking mutexes for performing
- * the variable access.
+ * Represents a memory access: stores the array expression, the offset expression, the access type
+ * (read/write) and the set of acquired/blocking mutexes for performing the variable access.
  */
 private class MemoryAccessWithMutexes(
+  label: XcfaLabel,
   val array: Expr<*>,
   val offset: Expr<*>,
-  label: XcfaLabel,
+  /** The cell is `_Atomic`, so nothing that touches it races with anything. */
+  val atomic: Boolean,
+  /**
+   * The address reads memory after an earlier memory write of the same label, so it cannot be
+   * evaluated in the state before the label.
+   */
+  val addressAfterMemoryWrite: Boolean,
+  /** An earlier statement of the label wrote memory, so the precondition reads changed memory. */
+  val afterMemoryWrite: Boolean,
   access: AccessType,
-  acquiredMutexes: Set<String>,
-  blockingMutexes: Set<String>,
-) : GlobalAccessWithMutexes(label, access, acquiredMutexes, blockingMutexes)
+  acquiredMutexes: Set<MutexLock>,
+  blockingMutexes: Set<MutexLock>,
+  precedingStmts: List<Stmt>,
+) : GlobalAccessWithMutexes(label, access, acquiredMutexes, blockingMutexes, precedingStmts)
 
 /**
  * Returns the global variable accesses of the label.
@@ -209,16 +312,18 @@ private class MemoryAccessWithMutexes(
  */
 private fun XcfaLabel.getGlobalVarsWithNeededMutexes(
   xcfa: XCFA,
-  currentMutexes: Set<String>,
+  currentMutexes: Set<MutexLock>,
+  state: State,
 ): List<GlobalVarAccessWithMutexes> {
   val globalVars = xcfa.globalVars
   val acquiredMutexes = currentMutexes.toMutableSet()
-  val blockingMutexes = mutableSetOf<String>()
+  val blockingMutexes = mutableSetOf<MutexLock>()
   val accesses = mutableListOf<GlobalVarAccessWithMutexes>()
+  val precedingStmts = mutableListOf<Stmt>()
   getFlatLabels().forEach { label ->
     if (label is FenceLabel) {
-      acquiredMutexes.addAll(label.acquiredMutexes.map { it.name })
-      blockingMutexes.addAll(label.blockingMutexes.map { it.name })
+      acquiredMutexes.addAll(label.acquiredMutexes(state))
+      blockingMutexes.addAll(label.blockingMutexes(state))
     } else {
       label.collectGlobalVars(globalVars).forEach { (v, access) ->
         if (accesses.none { it.globalVar == v && (it.access == access && it.access == WRITE) }) {
@@ -229,11 +334,14 @@ private fun XcfaLabel.getGlobalVarsWithNeededMutexes(
               access,
               acquiredMutexes.toSet(),
               blockingMutexes.toSet(),
+              precedingStmts.toList(),
             )
           )
         }
       }
     }
+
+    label.toStmt().takeUnless { it is SkipStmt }?.let(precedingStmts::add)
   }
   return accesses
 }
@@ -245,45 +353,54 @@ private fun XcfaLabel.getGlobalVarsWithNeededMutexes(
  * @return the list of memory accesses (c.f., [MemoryAccessWithMutexes])
  */
 private fun XcfaLabel.getMemoryAccessesWithMutexes(
-  currentMutexes: Set<String>
+  currentMutexes: Set<MutexLock>,
+  xcfa: XCFA,
+  parseContext: ParseContext,
+  state: State,
 ): List<MemoryAccessWithMutexes> {
   val acquiredMutexes = currentMutexes.toMutableSet()
-  val blockingMutexes = mutableSetOf<String>()
+  val blockingMutexes = mutableSetOf<MutexLock>()
   val accesses = mutableListOf<MemoryAccessWithMutexes>()
-  val changedVars = mutableSetOf<VarDecl<*>>()
+  val precedingStmts = mutableListOf<Stmt>()
+  var memoryWritten = false
   getFlatLabels().forEach { label ->
     if (label is FenceLabel) {
-      acquiredMutexes.addAll(label.acquiredMutexes.map { it.name })
-      blockingMutexes.addAll(label.blockingMutexes.map { it.name })
+      acquiredMutexes.addAll(label.acquiredMutexes(state))
+      blockingMutexes.addAll(label.blockingMutexes(state))
     } else {
-      label.dereferencesWithAccessType.forEach { (deref, access) ->
-        val vars = ExprUtils.getVars(deref.array) + ExprUtils.getVars(deref.offset)
-        check(changedVars.intersect(vars).isEmpty()) {
-          "Cannot handle dereferences with changed variables in between: $this"
-        }
+      val derefs = label.dereferencesWithAccessType
+      derefs.forEach { (deref, access) ->
+        val addressAfterMemoryWrite =
+          memoryWritten &&
+            (deref.array.dereferences.isNotEmpty() || deref.offset.dereferences.isNotEmpty())
         if (
-          accesses.none {
-            it.array == deref.array &&
-              it.offset == deref.offset &&
-              (it.access == access && it.access == WRITE)
-          }
+          addressAfterMemoryWrite ||
+            accesses.none {
+              it.array == deref.array &&
+                it.offset == deref.offset &&
+                (it.access == access && it.access == WRITE) &&
+                it.precedingStatements == precedingStmts
+            }
         ) {
           accesses.add(
             MemoryAccessWithMutexes(
+              label,
               deref.array,
               deref.offset,
-              label,
+              deref.addressesAtomicData(xcfa.globalVars, parseContext),
+              addressAfterMemoryWrite,
+              memoryWritten,
               access,
               acquiredMutexes.toSet(),
               blockingMutexes.toSet(),
+              precedingStmts.toList(),
             )
           )
         }
       }
+      if (derefs.values.any { it.isWritten }) memoryWritten = true
     }
-    label.collectVarsWithAccessType().forEach { (v, access) ->
-      if (access.isWritten) changedVars.add(v)
-    }
+    label.toStmt().takeUnless { it is SkipStmt }?.let(precedingStmts::add)
   }
   return accesses
 }
@@ -291,46 +408,120 @@ private fun XcfaLabel.getMemoryAccessesWithMutexes(
 /**
  * Checks whether the two given memory locations may be the same under the given state.
  *
- * @param array1 the array expression of the first memory location
- * @param offset1 the offset expression of the first memory location
- * @param array2 the array expression of the second memory location
- * @param offset2 the offset expression of the second memory location
- * @param state the state to check under
  * @return true if the two memory locations may be the same, false otherwise
  */
 private fun mayBeSameMemoryLocation(
-  array1: Expr<*>,
-  offset1: Expr<*>,
-  array2: Expr<*>,
-  offset2: Expr<*>,
+  access1: MemoryAccessWithMutexes,
+  access2: MemoryAccessWithMutexes,
   state: XcfaState<out PtrState<out ExprState>>,
 ): Boolean {
-  var expr: Expr<BoolType> = And(Eq(array1, array2), Eq(offset1, offset2))
-  expr =
-    (state.sGlobal.innerState as? ExplState)?.let { s -> ExprUtils.simplify(expr, s.`val`) }
-      ?: ExprUtils.simplify(expr)
+  val precondition1 = ExprUtils.simplify(access1.precondition)
+  val precondition2 = ExprUtils.simplify(access2.precondition)
+  val indexing1 = access1.finalIndexing
+  val indexing2 = access2.finalIndexing
+
+  val zeroIndexing = VarIndexingFactory.indexing(0)
+  if (
+    state.sGlobal.innerState is ExplState &&
+      precondition1 == True() &&
+      precondition2 == True() &&
+      indexing1 == zeroIndexing &&
+      indexing2 == zeroIndexing
+  ) {
+    val expr = And(Eq(access1.array, access2.array), Eq(access1.offset, access2.offset))
+    val simplified = ExprUtils.simplify(expr, (state.sGlobal.innerState as ExplState).`val`)
+    if (simplified == False()) return false
+  }
+
+  // Nested dereferences in the addresses and the preconditions read the current memory contents,
+  // which abstract states name by uniqueness index 0 (see `repatch`); the refiner hands over
+  // patched states. A precondition after a memory write reads changed memory, so it is left out.
+  val array1 = access1.array.readingCurrentMemory()
+  val offset1 = access1.offset.readingCurrentMemory()
+  val array2 = access2.array.readingCurrentMemory()
+  val offset2 = access2.offset.readingCurrentMemory()
+
   val possibleSameLocation =
-    try {
-      WithPushPop(dependencySolver).use {
-        dependencySolver.add(PathUtils.unfold(state.sGlobal.toExpr(), 0))
-        dependencySolver.add(PathUtils.unfold(expr, 0))
-        dependencySolver.check().isSat
+    access1.addressAfterMemoryWrite ||
+      access2.addressAfterMemoryWrite ||
+      try {
+        WithPushPop(dependencySolver).use {
+          dependencySolver.add(
+            ExprUtils.simplify(
+              And(
+                PathUtils.unfold(state.sGlobal.innerState.repatch().toExpr(), zeroIndexing),
+                PathUtils.unfold(access1.queryPrecondition(precondition1), zeroIndexing),
+                PathUtils.unfold(access2.queryPrecondition(precondition2), zeroIndexing),
+                Eq(PathUtils.unfold(array1, indexing1), PathUtils.unfold(array2, indexing2)),
+                Eq(PathUtils.unfold(offset1, indexing1), PathUtils.unfold(offset2, indexing2)),
+              )
+            )
+          )
+          dependencySolver.check().isSat
+        }
+      } catch (_: Exception) {
+        // TODO this is reached when having incomplete dereferences, we should do it properly
+        true
       }
-    } catch (_: Exception) {
-      // TODO this is reached when having incomplete dereferences, we should do it properly
-      true
-    }
   if (!possibleSameLocation) return false
 
   val pointerPartitions = state.xcfa!!.getPointerPartitions()
-  val a1 = (array1 as? RefExpr<*>)?.decl ?: return true // cannot decide
-  val a2 = (array2 as? RefExpr<*>)?.decl ?: return true // cannot decide
-  return pointerPartitions.any { a1 in it.first && a2 in it.first }
+  val a1 = (access1.array as? RefExpr<*>)?.decl ?: return true // cannot decide
+  val a2 = (access2.array as? RefExpr<*>)?.decl ?: return true // cannot decide
+  val partition1 = pointerPartitions.indexOfFirst { a1.belongsTo(it, state) }
+  val partition2 = pointerPartitions.indexOfFirst { a2.belongsTo(it, state) }
+  if (partition1 == -1 || partition2 == -1) return true // cannot decide
+  return partition1 == partition2
 }
 
-private fun canExecuteConcurrently(
+private fun MemoryAccessWithMutexes.queryPrecondition(
+  precondition: Expr<BoolType>
+): Expr<BoolType> = if (afterMemoryWrite) True() else precondition.readingCurrentMemory()
+
+private fun <T : Type> Expr<T>.readingCurrentMemory(): Expr<T> =
+  when (this) {
+    is Dereference<*, *, T> -> withUniquenessExpr(Int(0)).map { it.readingCurrentMemory() }
+    else -> map { it.readingCurrentMemory() }
+  }
+
+private fun Decl<*>.belongsTo(
+  partition: Pair<Set<VarDecl<*>>, Set<LitExpr<*>>>,
+  state: XcfaState<*>,
+): Boolean {
+  if (this in partition.first) return true
+  for ((_, procState) in state.processes) {
+    for (lookUp in procState.varLookup) {
+      for ((original, prefixed) in lookUp) {
+        if (prefixed == this) {
+          return original in partition.first
+        }
+      }
+    }
+  }
+  return false
+}
+
+private fun mayExecuteConcurrently(
   access1: GlobalAccessWithMutexes,
   access2: GlobalAccessWithMutexes,
 ): Boolean =
   (access1.acquiredMutexes intersect access2.blockingMutexes).isEmpty() &&
     (access2.acquiredMutexes intersect access1.blockingMutexes).isEmpty()
+
+private fun concurrentExecutionCondition(
+  access1: GlobalAccessWithMutexes,
+  access2: GlobalAccessWithMutexes,
+): Expr<BoolType> =
+  And(
+    noCommon(access1.acquiredMutexes, access2.blockingMutexes),
+    noCommon(access2.acquiredMutexes, access1.blockingMutexes),
+  )
+
+private fun noCommon(mutexes1: Set<MutexLock>, mutexes2: Set<MutexLock>): Expr<BoolType> =
+  And(
+    mutexes1.flatMap { m1 ->
+      mutexes2.mapNotNull { m2 ->
+        if (!m1.isKnown() || !m2.isKnown()) NeqExpr.create2(m1.lock, m2.lock) else null
+      }
+    }
+  )

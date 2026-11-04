@@ -17,7 +17,6 @@
 
 package hu.bme.mit.theta.xcfa.cli.params
 
-import com.google.gson.reflect.TypeToken
 import hu.bme.mit.theta.analysis.LTS
 import hu.bme.mit.theta.analysis.PartialOrd
 import hu.bme.mit.theta.analysis.Prec
@@ -33,6 +32,7 @@ import hu.bme.mit.theta.analysis.algorithm.loopchecker.abstraction.LoopCheckerSe
 import hu.bme.mit.theta.analysis.expl.ExplPrec
 import hu.bme.mit.theta.analysis.expl.ExplState
 import hu.bme.mit.theta.analysis.expl.ItpRefToExplPrec
+import hu.bme.mit.theta.analysis.expl.VarsRefToExplPrec
 import hu.bme.mit.theta.analysis.expr.ExprAction
 import hu.bme.mit.theta.analysis.expr.ExprState
 import hu.bme.mit.theta.analysis.expr.refinement.*
@@ -43,10 +43,7 @@ import hu.bme.mit.theta.analysis.prod2.Prod2Prec
 import hu.bme.mit.theta.analysis.prod2.Prod2State
 import hu.bme.mit.theta.analysis.prod2.prod2explpred.AutomaticItpRefToProd2ExplPredPrec
 import hu.bme.mit.theta.analysis.prod2.prod2explpred.Prod2ExplPredAbstractors
-import hu.bme.mit.theta.analysis.ptr.ItpRefToPtrPrec
-import hu.bme.mit.theta.analysis.ptr.PtrPrec
-import hu.bme.mit.theta.analysis.ptr.PtrState
-import hu.bme.mit.theta.analysis.ptr.getPtrPartialOrd
+import hu.bme.mit.theta.analysis.ptr.*
 import hu.bme.mit.theta.analysis.unit.UnitAnalysis
 import hu.bme.mit.theta.analysis.unit.UnitPrec
 import hu.bme.mit.theta.analysis.unit.UnitState
@@ -68,19 +65,19 @@ import hu.bme.mit.theta.xcfa.analysis.coi.XcfaCoi
 import hu.bme.mit.theta.xcfa.analysis.coi.XcfaCoiMultiThread
 import hu.bme.mit.theta.xcfa.analysis.coi.XcfaCoiSingleThread
 import hu.bme.mit.theta.xcfa.analysis.por.*
+import hu.bme.mit.theta.xcfa.cli.utils.PrecReuse
 import hu.bme.mit.theta.xcfa.cli.utils.XcfaDistToErrComparator
 import hu.bme.mit.theta.xcfa.cli.utils.XcfaSegmentOrderComparator
 import hu.bme.mit.theta.xcfa.cli.witnesstransformation.ApplyWitnessPass
 import hu.bme.mit.theta.xcfa.model.XCFA
 import hu.bme.mit.theta.xcfa.utils.collectAssumes
 import hu.bme.mit.theta.xcfa.utils.collectVars
-import java.lang.reflect.Type
 import java.util.function.Predicate
+import kotlin.random.Random
 
 enum class InputType {
   C,
   LLVM,
-  JSON,
   DSL,
   CHC,
   LITMUS,
@@ -103,13 +100,15 @@ enum class Backend {
   PORTFOLIO,
   TRACEGEN,
   MDD,
+  MDD_CEGAR,
   IC3,
+  DSS,
   NONE,
 }
 
 enum class POR(
   val getLts:
-    (XCFA, MutableMap<VarDecl<*>, MutableSet<ExprState>>) -> LTS<
+    (XCFA, MutableMap<VarDecl<*>, MutableSet<ExprState>>, Random) -> LTS<
         XcfaState<out PtrState<out ExprState>>,
         XcfaAction,
       >,
@@ -117,11 +116,11 @@ enum class POR(
   val isAbstractionAware: Boolean,
 ) {
 
-  NOPOR({ _, _ -> getXcfaLts() }, false, false),
-  SPOR({ xcfa, _ -> XcfaSporLts(xcfa) }, false, false),
-  AASPOR({ xcfa, registry -> XcfaAasporLts(xcfa, registry) }, false, true),
-  DPOR({ xcfa, _ -> XcfaDporLts(xcfa) }, true, false),
-  AADPOR({ xcfa, _ -> XcfaAadporLts(xcfa) }, true, true),
+  NOPOR({ _, _, random -> getXcfaLts(random) }, false, false),
+  SPOR({ xcfa, _, random -> XcfaSporLts(xcfa, random) }, false, false),
+  AASPOR({ xcfa, registry, random -> XcfaAasporLts(xcfa, registry, random) }, false, true),
+  DPOR({ xcfa, _, random -> XcfaDporLts(xcfa, random) }, true, false),
+  AADPOR({ xcfa, _, random -> XcfaAadporLts(xcfa, random) }, true, true),
 }
 
 enum class Strategy {
@@ -166,10 +165,13 @@ enum class Domain(
         out Prec,
         out Refutation,
       >,
+  /** Precision refiner for [Refinement.UNSAT_CORE], or null if the domain does not support it. */
+  val varsPrecRefiner:
+    (() -> PrecRefiner<out ExprState, out ExprAction, out Prec, VarsRefutation>)? =
+    null,
   val initPrec: (XCFA, InitPrec) -> XcfaPrec<out PtrPrec<*>>,
   val partialOrd: (Solver) -> PartialOrd<out PtrState<out ExprState>>,
   val nodePruner: NodePruner<out ExprState, out ExprAction>,
-  val stateType: Type,
 ) {
 
   EXPL(
@@ -213,10 +215,14 @@ enum class Domain(
         ItpRefToPtrPrec(ItpRefToExplPrec())
       )
     },
+    varsPrecRefiner = {
+      XcfaPrecRefiner<PtrState<ExplState>, ExplPrec, VarsRefutation>(
+        VarsRefToPtrPrec(VarsRefToExplPrec())
+      )
+    },
     initPrec = { x, ip -> ip.explPrec(x) },
     partialOrd = { PartialOrd<ExplState> { s1, s2 -> s1.isLeq(s2) }.getPtrPartialOrd() },
     nodePruner = AtomicNodePruner<XcfaState<PtrState<ExplState>>, XcfaAction>(),
-    stateType = TypeToken.get(ExplState::class.java).type,
   ),
   PRED_BOOL(
     asgAbstractor = {
@@ -269,7 +275,6 @@ enum class Domain(
     initPrec = { x, ip -> ip.predPrec(x) },
     partialOrd = { solver -> PredOrd.create(solver).getPtrPartialOrd() },
     nodePruner = AtomicNodePruner<XcfaState<PtrState<PredState>>, XcfaAction>(),
-    stateType = TypeToken.get(PredState::class.java).type,
   ),
   PRED_CART(
     asgAbstractor = {
@@ -322,7 +327,6 @@ enum class Domain(
     initPrec = { x, ip -> ip.predPrec(x) },
     partialOrd = { solver -> PredOrd.create(solver).getPtrPartialOrd() },
     nodePruner = AtomicNodePruner<XcfaState<PtrState<PredState>>, XcfaAction>(),
-    stateType = TypeToken.get(PredState::class.java).type,
   ),
   PRED_SPLIT(
     asgAbstractor = {
@@ -375,7 +379,6 @@ enum class Domain(
     initPrec = { x, ip -> ip.predPrec(x) },
     partialOrd = { solver -> PredOrd.create(solver).getPtrPartialOrd() },
     nodePruner = AtomicNodePruner<XcfaState<PtrState<PredState>>, XcfaAction>(),
-    stateType = TypeToken.get(PredState::class.java).type,
   ),
   EXPL_PRED_SPLIT(
     asgAbstractor = {
@@ -436,7 +439,6 @@ enum class Domain(
     },
     nodePruner =
       AtomicNodePruner<XcfaState<PtrState<Prod2State<ExplState, PredState>>>, XcfaAction>(),
-    stateType = TypeToken.get(Prod2State::class.java).type,
   ),
   EXPL_PRED_STMT(
     asgAbstractor = {
@@ -497,7 +499,6 @@ enum class Domain(
     },
     nodePruner =
       AtomicNodePruner<XcfaState<PtrState<Prod2State<ExplState, PredState>>>, XcfaAction>(),
-    stateType = TypeToken.get(Prod2State::class.java).type,
   ),
   UNIT(
     asgAbstractor = {
@@ -542,7 +543,6 @@ enum class Domain(
     initPrec = { _, _ -> XcfaPrec(PtrPrec(UnitPrec.getInstance())) },
     partialOrd = { UnitAnalysis.getInstance().partialOrd.getPtrPartialOrd() },
     nodePruner = AtomicNodePruner<XcfaState<PtrState<UnitState>>, XcfaAction>(),
-    stateType = TypeToken.get(UnitState::class.java).type,
   ),
 }
 
@@ -771,47 +771,53 @@ enum class InitPrec(
       )
     },
   ),
+  REUSE(
+    explPrec = { xcfa -> XcfaPrec(PtrPrec(PrecReuse.get<ExplPrec>())) },
+    predPrec = { xcfa -> XcfaPrec(PtrPrec(PrecReuse.get<PredPrec>())) },
+    prod2Prec = { error("REUSE is not supported for the product domain.") },
+  ),
 }
 
 enum class ConeOfInfluenceMode(
   val getLts:
-    (XCFA, ParseContext, POR, MutableMap<VarDecl<*>, MutableSet<ExprState>>) -> Pair<
+    (XCFA, ParseContext, POR, MutableMap<VarDecl<*>, MutableSet<ExprState>>, Random) -> Pair<
         XcfaCoi?,
         LTS<XcfaState<out PtrState<out ExprState>>, XcfaAction>,
       >
 ) {
 
-  NO_COI({ xcfa, _, por, ivr ->
-    val lts = por.getLts(xcfa, ivr).also { NO_COI.porLts = it }
+  NO_COI({ xcfa, _, por, ivr, random ->
+    val lts = por.getLts(xcfa, ivr, random).also { NO_COI.porLts = it }
     null to lts
   }),
-  COI({ xcfa, pc, por, ivr ->
-    val coi = getCoi(xcfa, pc)
-    coi.coreLts = por.getLts(xcfa, ivr).also { COI.porLts = it }
+  COI({ xcfa, pc, por, ivr, random ->
+    val coi = getCoi(xcfa, pc, random)
+    coi.coreLts = por.getLts(xcfa, ivr, random).also { COI.porLts = it }
     coi to coi.lts
   }),
-  POR_COI({ xcfa, pc, por, ivr ->
-    val coi = getCoi(xcfa, pc)
-    coi.coreLts = getXcfaLts()
+  POR_COI({ xcfa, pc, por, ivr, random ->
+    val coi = getCoi(xcfa, pc, random)
+    coi.coreLts = getXcfaLts(random)
     val lts =
-      if (por.isAbstractionAware) XcfaAasporCoiLts(xcfa, ivr, coi.lts)
-      else XcfaSporCoiLts(xcfa, coi.lts)
+      if (por.isAbstractionAware) XcfaAasporCoiLts(xcfa, ivr, coi.lts, random)
+      else XcfaSporCoiLts(xcfa, coi.lts, random)
     coi to lts
   }),
-  POR_COI_POR({ xcfa, pc, por, ivr ->
-    val coi = getCoi(xcfa, pc)
-    coi.coreLts = por.getLts(xcfa, ivr).also { POR_COI_POR.porLts = it }
+  POR_COI_POR({ xcfa, pc, por, ivr, random ->
+    val coi = getCoi(xcfa, pc, random)
+    coi.coreLts = por.getLts(xcfa, ivr, random).also { POR_COI_POR.porLts = it }
     val lts =
-      if (por.isAbstractionAware) XcfaAasporCoiLts(xcfa, ivr, coi.lts)
-      else XcfaSporCoiLts(xcfa, coi.lts)
+      if (por.isAbstractionAware) XcfaAasporCoiLts(xcfa, ivr, coi.lts, random)
+      else XcfaSporCoiLts(xcfa, coi.lts, random)
     coi to lts
   });
 
   var porLts: LTS<XcfaState<out PtrState<out ExprState>>, XcfaAction>? = null
 }
 
-private fun getCoi(xcfa: XCFA, parseContext: ParseContext): XcfaCoi =
-  if (parseContext.multiThreading) XcfaCoiMultiThread(xcfa) else XcfaCoiSingleThread(xcfa)
+private fun getCoi(xcfa: XCFA, parseContext: ParseContext, random: Random): XcfaCoi =
+  if (parseContext.multiThreading) XcfaCoiMultiThread(xcfa, random)
+  else XcfaCoiSingleThread(xcfa, random)
 
 // TODO CexMonitor: disable for multi_seq
 // TODO add new monitor to xsts cli
@@ -832,4 +838,12 @@ enum class WitnessLevel {
   SVCOMP,
   ALL,
   BTOR2,
+}
+
+/** Initial value of the dereference memory arrays. */
+enum class MemoryInit {
+  /** ZERO for the MDD backend, UNCONSTRAINED otherwise. */
+  AUTO,
+  ZERO,
+  UNCONSTRAINED,
 }

@@ -1,5 +1,5 @@
 /*
- *  Copyright 2025 Budapest University of Technology and Economics
+ *  Copyright 2026 Budapest University of Technology and Economics
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -54,8 +54,7 @@ fun multithreadPortfolio(
   val checker = { config: XcfaConfig<*, *> -> runConfig(config, logger, uniqueLogger, true) }
 
   var baseConfig: XcfaConfig<CFrontendConfig, CegarConfig> =
-    baseCegarConfig(xcfa, mcm, parseContext, portfolioConfig, false)
-      as XcfaConfig<CFrontendConfig, CegarConfig>
+    baseCegarConfig(xcfa, parseContext, portfolioConfig) as XcfaConfig<CFrontendConfig, CegarConfig>
 
   val baseCegarConfig = baseConfig.backendConfig.specConfig!!
   val verifiedProperty = baseConfig.inputConfig.property.verifiedProperty
@@ -73,36 +72,19 @@ fun multithreadPortfolio(
   fun getStm(inProcess: Boolean): STM {
     val edges = LinkedHashSet<Edge>()
 
-    val cegarXcfa =
-      xcfa.optimizeFurther(
-        ProcedurePassManager(
-          listOf(
-            LbePass(parseContext, LBE_LOCAL),
-            NormalizePass(),
-            DeterministicPass(),
-            UnusedVarPass(logger, portfolioConfig.inputConfig.property),
-            EmptyEdgeRemovalPass(),
-            UnusedLocRemovalPass(),
-          )
-        )
-      )
-
     val property = baseConfig.inputConfig.property.copy()
     val ocXcfa =
       if (baseConfig.inputConfig.property.verifiedProperty == DATA_RACE)
         xcfa.optimizeFurther(
-          ProcedurePassManager(listOf(DataRaceToReachabilityPass(property, true)))
+          ProcedurePassManager(
+            listOf(DataRaceToReachabilityPass(property, parseContext, enabled = true))
+          )
         )
       else xcfa
 
     val multithreadCegarBaseConfig =
       baseConfig.copy(
-        inputConfig =
-          baseConfig.inputConfig.copy(
-            xcfaWCtx =
-              if (portfolioConfig.backendConfig.parseInProcess) null
-              else Triple(cegarXcfa, mcm, parseContext)
-          ),
+        inputConfig = baseConfig.inputConfig.copy(xcfaWCtx = null),
         frontendConfig = baseConfig.frontendConfig.copy(lbeLevel = LBE_LOCAL),
       )
 
@@ -124,7 +106,6 @@ fun multithreadPortfolio(
             backend = OC,
             solverHome = baseConfig.backendConfig.solverHome,
             inProcess = inProcess,
-            parseInProcess = inProcess && portfolioConfig.backendConfig.parseInProcess,
             specConfig = OcConfig(decisionProcedure = OcDecisionProcedureType.BASIC),
           ),
         outputConfig = baseConfig.outputConfig,
@@ -143,6 +124,7 @@ fun multithreadPortfolio(
                   decisionProcedure = OcDecisionProcedureType.BASIC,
                   autoConflict = AutoConflictFinderConfig.GENERIC,
                   autoConflictBound = 3,
+                  forceUnrollBoundStart = 1,
                 ),
             )
         ),
@@ -198,8 +180,8 @@ fun multithreadPortfolio(
         multithreadCegarBaseConfig.adaptConfig(
           inProcess = inProcess,
           domain = EXPL,
-          abstractionSolver = "mathsat:5.6.10",
-          refinementSolver = "mathsat:5.6.10",
+          abstractionSolver = portfolioConfig.solverVersionOrLatestFallback("mathsat", "5.6.10"),
+          refinementSolver = portfolioConfig.solverVersionOrLatestFallback("mathsat", "5.6.10"),
           refinement = NWT_IT_WP,
           timeoutMs = 0,
         ),

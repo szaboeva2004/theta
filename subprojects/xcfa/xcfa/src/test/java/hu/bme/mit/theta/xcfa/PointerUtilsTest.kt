@@ -1,5 +1,5 @@
 /*
- *  Copyright 2025 Budapest University of Technology and Economics
+ *  Copyright 2026 Budapest University of Technology and Economics
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -17,11 +17,19 @@ package hu.bme.mit.theta.xcfa
 
 import hu.bme.mit.theta.core.decl.VarDecl
 import hu.bme.mit.theta.core.type.LitExpr
+import hu.bme.mit.theta.core.type.anytype.Dereference
+import hu.bme.mit.theta.core.type.inttype.IntExprs.Add
 import hu.bme.mit.theta.core.type.inttype.IntExprs.Int
+import hu.bme.mit.theta.core.type.inttype.IntExprs.Mod
+import hu.bme.mit.theta.core.utils.TypeUtils.cast
+import hu.bme.mit.theta.xcfa.model.ParamDirection
 import hu.bme.mit.theta.xcfa.model.XCFA
 import hu.bme.mit.theta.xcfa.model.procedure
 import hu.bme.mit.theta.xcfa.model.xcfa
+import hu.bme.mit.theta.xcfa.utils.pointsTo
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.MethodSource
 
@@ -128,7 +136,53 @@ class PointerUtilsTest {
             )
           },
         ),
+        arrayOf(
+          callXcfa("xcfa4", "r"),
+          { partitions: PointerPartitions ->
+            assertPartitionEquals(
+              partitions,
+              listOf(setOf("p") to setOf(Int(1)), setOf("q") to setOf(Int(2))),
+            )
+          },
+        ),
+        arrayOf(
+          callXcfa("xcfa5", "0"),
+          { partitions: PointerPartitions ->
+            assertPartitionEquals(
+              partitions,
+              listOf(setOf("p") to setOf(Int(1)), setOf("q") to setOf(Int(2))),
+            )
+          },
+        ),
       )
+
+    /** Passes `a = 1` and `b = 2` to the pointers `p` and `q`, after the return value [ret]. */
+    private fun callXcfa(name: String, ret: String): XCFA =
+      xcfa(name) {
+        val callee =
+          procedure("callee") {
+            "ret" type Int() direction ParamDirection.OUT
+            "p" type Int() direction ParamDirection.IN
+            "q" type Int() direction ParamDirection.IN
+            val x = "x" type Int()
+            (init to final) {
+              x.assign("(deref p 0 Int)")
+              x.assign("(deref q 0 Int)")
+            }
+          }
+        val main =
+          procedure("main") {
+            "r" type Int()
+            val a = "a" type Int()
+            val b = "b" type Int()
+            (init to "L") {
+              a.assign("1")
+              b.assign("2")
+            }
+            ("L" to final) { callee(ret, "a", "b") }
+          }
+        main.start()
+      }
 
     private fun assertPartitionEquals(
       expected: PointerPartitions,
@@ -143,6 +197,16 @@ class PointerUtilsTest {
         }
       assertEquals(expected.toSet(), transformedActual.toSet())
     }
+  }
+
+  @Test
+  fun valuesOfAnExpression() {
+    val xcfa = data().first()[0] as XCFA
+    val p = xcfa.procedures.flatMap { it.vars }.first { it.name == "p" }
+    assertEquals(setOf(Int(1)), Add(cast(p.ref, Int()), Int(1)).pointsTo(xcfa))
+    // A memory read has no variables to substitute, but its value is still unknown.
+    val index = Mod(Dereference.of(Int(2), Int(0), Int()), Int(8))
+    assertNull(index.pointsTo(xcfa))
   }
 
   @ParameterizedTest

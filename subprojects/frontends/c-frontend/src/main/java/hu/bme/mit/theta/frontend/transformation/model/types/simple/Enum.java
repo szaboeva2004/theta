@@ -25,6 +25,28 @@ public class Enum extends CSimpleType {
     private final String id;
     private final Map<String, Optional<Expr<?>>> fields;
 
+    /**
+     * Global registry of enumeration-constant values, keyed by enumerator name. C enumerators are
+     * ordinary integer constants usable anywhere an expression is expected, but the frontend models
+     * an enum as a plain {@code int}, so the enumerator names would otherwise be unresolvable. This
+     * registry lets the expression visitor fold an enumerator reference to its integer value. Like
+     * {@code Struct}'s type registry, it is cleared at the start of each compilation unit, as one
+     * JVM may parse several times (see {@link #resetRegistry()}).
+     */
+    private static final Map<String, Long> definedConstants = new LinkedHashMap<>();
+
+    public static void resetRegistry() {
+        definedConstants.clear();
+    }
+
+    public static Long getConstantValue(String name) {
+        return definedConstants.get(name);
+    }
+
+    public static void defineConstant(String name, long value) {
+        definedConstants.put(name, value);
+    }
+
     Enum(String id, Map<String, Optional<Expr<?>>> fields) {
         this.fields = fields;
         this.id = id;
@@ -48,6 +70,7 @@ public class Enum extends CSimpleType {
         Enum anEnum = new Enum(id, fields);
         anEnum.setAtomic(this.isAtomic());
         anEnum.setExtern(this.isExtern());
+        anEnum.setStaticStorage(this.isStaticStorage());
         anEnum.setTypedef(this.isTypedef());
         anEnum.setVolatile(this.isVolatile());
         return anEnum;

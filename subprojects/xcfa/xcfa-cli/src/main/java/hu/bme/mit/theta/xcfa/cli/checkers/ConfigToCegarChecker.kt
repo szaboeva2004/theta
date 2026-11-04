@@ -1,5 +1,5 @@
 /*
- *  Copyright 2025 Budapest University of Technology and Economics
+ *  Copyright 2026 Budapest University of Technology and Economics
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -72,7 +72,9 @@ fun getCegarChecker(
 
   val ignoredVarRegistry = mutableMapOf<VarDecl<*>, MutableSet<ExprState>>()
 
-  val (coi, lts) = cegarConfig.coi.getLts(xcfa, parseContext, cegarConfig.por, ignoredVarRegistry)
+  val random = explorationRandom()
+  val (coi, lts) =
+    cegarConfig.coi.getLts(xcfa, parseContext, cegarConfig.por, ignoredVarRegistry, random)
   val waitlist =
     if (cegarConfig.por.isDynamic) {
       (cegarConfig.coi.porLts as XcfaDporLts).waitlist
@@ -89,7 +91,8 @@ fun getCegarChecker(
   val corePartialOrd: PartialOrd<XcfaState<PtrState<ExprState>>> =
     if (xcfa.isInlined) getPartialOrder(globalStatePartialOrd)
     else getStackPartialOrder(globalStatePartialOrd)
-  val errorDetector = getXcfaErrorDetector(config.inputConfig.property.verifiedProperty)
+  val errorDetector =
+    getXcfaErrorDetector(config.inputConfig.property.verifiedProperty, parseContext)
   val abstractor: ArgAbstractor<ExprState, ExprAction, Prec> =
     cegarConfig.abstractorConfig.domain.abstractor(
       xcfa,
@@ -114,11 +117,20 @@ fun getCegarChecker(
       cegarConfig.refinerConfig.refinement.refiner(refinementSolverFactory, cegarConfig.cexMonitor)
         as ExprTraceChecker<Refutation>
     )
+  val domain = cegarConfig.abstractorConfig.domain
   val precRefiner: PrecRefiner<ExprState, ExprAction, Prec, Refutation> =
-    cegarConfig.abstractorConfig.domain.itpPrecRefiner(
-      cegarConfig.refinerConfig.exprSplitter.exprSplitter,
-      xcfa,
-    ) as PrecRefiner<ExprState, ExprAction, Prec, Refutation>
+    if (cegarConfig.refinerConfig.refinement == Refinement.UNSAT_CORE) {
+      val varsPrecRefiner =
+        domain.varsPrecRefiner
+          ?: throw UnsupportedOperationException(
+            "UNSAT_CORE refinement is not supported with the $domain domain, use one of " +
+              Domain.entries.filter { it.varsPrecRefiner != null }
+          )
+      varsPrecRefiner()
+    } else {
+      domain.itpPrecRefiner(cegarConfig.refinerConfig.exprSplitter.exprSplitter, xcfa)
+    }
+      as PrecRefiner<ExprState, ExprAction, Prec, Refutation>
   val atomicNodePruner: NodePruner<ExprState, ExprAction> =
     cegarConfig.abstractorConfig.domain.nodePruner as NodePruner<ExprState, ExprAction>
   val refiner: ArgRefiner<ExprState, ExprAction, Prec> =
@@ -187,52 +199,23 @@ fun getCegarChecker(
                 .filter {
                   (it.state as XcfaState<PtrState<*>>).processes.any { it.value.locs.peek() == loc }
                 }
-                .map {
-                  (it.state as XcfaState<PtrState<*>>).sGlobal.innerState.let { s ->
-                    val declMap =
-                      (it.state as XcfaState<PtrState<*>>)
-                        .processes
-                        .map {
-                          it.value.varLookup.reversed().reduce { a, b -> a + b }.reverseMapping()
-                        }
-                        .reduce { a, b -> a + b }
-                    when (s) {
-                      is ExplState -> {
-                        if (s.isBottom) {
-                          ExplState.bottom()
-                        } else {
-                          ExplState.of(s.`val`.changeVars(declMap))
-                        }
-                      }
-                      is PredState -> {
-                        PredState.of(s.preds.map { ExprUtils.changeDecls(it, declMap) })
-                      }
-                      is Prod2State<*, *> -> {
-                        if (s.state1.isBottom) ExplState.bottom()
-                        else
-                          Prod2State.of(
-                            ExplState.of((s.state1 as ExplState).`val`.changeVars(declMap)),
-                            PredState.of(
-                              (s.state2 as PredState).preds.map {
-                                ExprUtils.changeDecls(it, declMap)
-                              }
-                            ),
-                          )
-                      }
-                      else -> {
-                        error("Unknown state: ${s}")
-                      }
-                    }
-                  }
+                .flatMap { node ->
+                  val state = node.state as XcfaState<PtrState<*>>
+                  state.processes.values
+                    .filter { it.locs.peek() == loc }
+                    .map { process -> generalizeProofState(state.sGlobal.innerState, process) }
+                    .stream()
                 }
                 .toList()
             }
 
-        return SafetyResult.safe(LocationInvariants(locmap))
+        return SafetyResult.safe(LocationInvariants(locmap), null, ret.prec.orElse(null))
       } else {
         return SafetyResult.unsafe(
           ret.asUnsafe().cex as Trace<XcfaState<PtrState<*>>, XcfaAction>,
           LocationInvariants(),
+          null,
+          ret.prec.orElse(null),
         )
       }
     }
@@ -241,5 +224,24 @@ fun getCegarChecker(
       SafetyResult<LocationInvariants, Trace<XcfaState<PtrState<*>>, XcfaAction>> {
       return check(cegarConfig.abstractorConfig.domain.initPrec(xcfa, cegarConfig.initPrec))
     }
+  }
+}
+
+// Generalize each process separately: two instances of one procedure can have different values
+// for the same source parameter, in particular their generated thread IDs.
+internal fun generalizeProofState(state: ExprState, process: XcfaProcessState): ExprState {
+  val declMap = process.varLookup.reversed().reduce { a, b -> a + b }.reverseMapping()
+  return when (state) {
+    is ExplState ->
+      if (state.isBottom) ExplState.bottom() else ExplState.of(state.`val`.changeVars(declMap))
+    is PredState -> PredState.of(state.preds.map { ExprUtils.changeDecls(it, declMap) })
+    is Prod2State<*, *> ->
+      if (state.state1.isBottom) ExplState.bottom()
+      else
+        Prod2State.of(
+          generalizeProofState(state.state1 as ExprState, process),
+          generalizeProofState(state.state2 as ExprState, process),
+        )
+    else -> error("Unknown state: $state")
   }
 }

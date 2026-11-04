@@ -1,5 +1,5 @@
 /*
- *  Copyright 2025 Budapest University of Technology and Economics
+ *  Copyright 2026 Budapest University of Technology and Economics
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@ import hu.bme.mit.theta.xcfa.cli.params.*
 import hu.bme.mit.theta.xcfa.cli.runConfig
 import hu.bme.mit.theta.xcfa.model.XCFA
 import hu.bme.mit.theta.xcfa.passes.LbePass
-import hu.bme.mit.theta.xcfa.passes.LoopUnrollPass
+import hu.bme.mit.theta.xcfa.passes.UnrollPass
 
 fun hornPortfolio(
   xcfa: XCFA,
@@ -42,16 +42,14 @@ fun hornPortfolio(
     XcfaConfig(
       inputConfig =
         portfolioConfig.inputConfig.copy(
-          xcfaWCtx =
-            if (portfolioConfig.backendConfig.parseInProcess) null
-            else Triple(xcfa, mcm, parseContext),
+          xcfaWCtx = null,
           propertyFile = null,
           property = portfolioConfig.inputConfig.property,
         ),
       frontendConfig =
         FrontendConfig(
           lbeLevel = LbePass.defaultLevel,
-          loopUnroll = LoopUnrollPass.UNROLL_LIMIT,
+          loopUnroll = UnrollPass.UNROLL_LIMIT,
           inputType = InputType.C,
           enableDataRaceToReachability =
             portfolioConfig.inputConfig.property.verifiedProperty == DATA_RACE,
@@ -99,7 +97,6 @@ fun hornPortfolio(
         backendConfig.copy(
           timeoutMs = timeoutMs,
           inProcess = inProcess,
-          parseInProcess = inProcess && portfolioConfig.backendConfig.parseInProcess,
           specConfig = backendConfig.specConfig!!.copy(solver = solver),
         )
     )

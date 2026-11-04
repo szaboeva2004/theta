@@ -1,5 +1,5 @@
 /*
- *  Copyright 2025 Budapest University of Technology and Economics
+ *  Copyright 2026 Budapest University of Technology and Economics
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -16,45 +16,53 @@
 package hu.bme.mit.theta.xcfa
 
 import hu.bme.mit.theta.core.decl.VarDecl
-import hu.bme.mit.theta.core.stmt.AssignStmt
-import hu.bme.mit.theta.core.stmt.AssumeStmt
-import hu.bme.mit.theta.core.stmt.HavocStmt
-import hu.bme.mit.theta.core.stmt.MemoryAssignStmt
-import hu.bme.mit.theta.core.stmt.SkipStmt
+import hu.bme.mit.theta.core.stmt.*
 import hu.bme.mit.theta.core.type.*
+import hu.bme.mit.theta.core.type.abstracttype.*
 import hu.bme.mit.theta.core.type.abstracttype.AbstractExprs.Geq
 import hu.bme.mit.theta.core.type.abstracttype.AbstractExprs.Leq
 import hu.bme.mit.theta.core.type.abstracttype.DivExpr
 import hu.bme.mit.theta.core.type.abstracttype.EqExpr
 import hu.bme.mit.theta.core.type.abstracttype.ModExpr
 import hu.bme.mit.theta.core.type.abstracttype.NeqExpr
+import hu.bme.mit.theta.core.type.abstracttype.PosExpr
 import hu.bme.mit.theta.core.type.anytype.Dereference
 import hu.bme.mit.theta.core.type.anytype.IteExpr
+import hu.bme.mit.theta.core.type.anytype.PrimeExpr
 import hu.bme.mit.theta.core.type.anytype.RefExpr
+import hu.bme.mit.theta.core.type.arraytype.ArrayInitExpr
 import hu.bme.mit.theta.core.type.arraytype.ArrayReadExpr
 import hu.bme.mit.theta.core.type.arraytype.ArrayType
 import hu.bme.mit.theta.core.type.arraytype.ArrayWriteExpr
 import hu.bme.mit.theta.core.type.booltype.*
 import hu.bme.mit.theta.core.type.booltype.BoolExprs.Or
-import hu.bme.mit.theta.core.type.bvtype.BvLitExpr
-import hu.bme.mit.theta.core.type.fptype.FpLitExpr
-import hu.bme.mit.theta.core.type.fptype.FpRoundingMode
+import hu.bme.mit.theta.core.type.bvtype.*
+import hu.bme.mit.theta.core.type.fptype.*
 import hu.bme.mit.theta.core.type.inttype.IntExprs.Int
 import hu.bme.mit.theta.core.type.inttype.IntLitExpr
+import hu.bme.mit.theta.core.type.inttype.IntModExpr
+import hu.bme.mit.theta.core.type.inttype.IntToRatExpr
 import hu.bme.mit.theta.core.type.rattype.RatLitExpr
+import hu.bme.mit.theta.core.type.rattype.RatToIntExpr
 import hu.bme.mit.theta.core.utils.BvUtils
 import hu.bme.mit.theta.core.utils.FpUtils
 import hu.bme.mit.theta.frontend.ParseContext
+import hu.bme.mit.theta.frontend.UnsupportedFrontendElementException
 import hu.bme.mit.theta.frontend.transformation.model.types.complex.CComplexType
 import hu.bme.mit.theta.frontend.transformation.model.types.complex.CComplexType.CComplexTypeVisitor
 import hu.bme.mit.theta.frontend.transformation.model.types.complex.compound.CArray
+import hu.bme.mit.theta.frontend.transformation.model.types.complex.compound.CPointer
 import hu.bme.mit.theta.frontend.transformation.model.types.complex.integer.CInteger
 import hu.bme.mit.theta.frontend.transformation.model.types.complex.integer.cbool.CBool
 import hu.bme.mit.theta.frontend.transformation.model.types.complex.integer.cchar.CChar
 import hu.bme.mit.theta.frontend.transformation.model.types.complex.integer.cint.CSignedInt
 import hu.bme.mit.theta.frontend.transformation.model.types.complex.integer.cint.CUnsignedInt
+import hu.bme.mit.theta.frontend.transformation.model.types.complex.integer.clonglong.CLongLong
+import hu.bme.mit.theta.frontend.transformation.model.types.complex.real.CDouble
+import hu.bme.mit.theta.frontend.transformation.model.types.complex.real.CFloat
 import hu.bme.mit.theta.xcfa.model.*
 import hu.bme.mit.theta.xcfa.utils.getFlatLabels
+import java.math.BigInteger
 
 private const val arraySize = 10
 
@@ -71,6 +79,7 @@ fun XCFA.toC(
     extern short __VERIFIER_nondet_short();
     extern int __VERIFIER_nondet_int();
     extern _Bool __VERIFIER_nondet__Bool();
+    ${nondetDecls(parseContext)}
     extern void reach_error();
     
     ${
@@ -283,8 +292,8 @@ private fun XcfaLabel.toC(parseContext: ParseContext, intRangeConstraint: Boolea
 private fun StmtLabel.toC(parseContext: ParseContext, intRangeConstraint: Boolean): String =
   when (stmt) {
     is HavocStmt<*> ->
-      "${stmt.varDecl.name.toC()} = __VERIFIER_nondet_${
-            CComplexType.getType(stmt.varDecl.ref, parseContext).toC()
+      "${stmt.varDecl.name.toC()} = ${
+            nondetName(CComplexType.getType(stmt.varDecl.ref, parseContext))
         }(); ${setOf(stmt.varDecl).unsafeBounds(parseContext, intRangeConstraint)}"
 
     is AssignStmt<*> -> "${stmt.varDecl.name.toC()} = ${stmt.expr.toC(parseContext)};"
@@ -304,6 +313,19 @@ fun Pair<VarDecl<*>, ParamDirection>.decl(parseContext: ParseContext): String =
 fun VarDecl<*>.decl(parseContext: ParseContext): String =
   "${CComplexType.getType(ref, parseContext).toC()} ${name.toC()}"
 
+private fun nondetName(type: CComplexType) = "__VERIFIER_nondet_${type.toC().toC()}"
+
+// Every havocked type needs a declared nondet function, not only the ones the preamble lists.
+private fun XCFA.nondetDecls(parseContext: ParseContext): String =
+  procedures
+    .flatMap { it.edges }
+    .flatMap { it.getFlatLabels() }
+    .mapNotNull { ((it as? StmtLabel)?.stmt as? HavocStmt<*>)?.varDecl }
+    .map { CComplexType.getType(it.ref, parseContext) }
+    .filter { it.toC() !in setOf("char", "short", "int", "_Bool") }
+    .distinctBy { it.toC() }
+    .joinToString("\n") { "extern ${it.toC()} ${nondetName(it)}();" }
+
 private fun CComplexType.toC(): String =
   when (this) {
     is CArray -> "${this.embeddedType.toC()}_arr"
@@ -311,6 +333,12 @@ private fun CComplexType.toC(): String =
     is CUnsignedInt -> "unsigned int"
     is CChar -> "char"
     is CBool -> "_Bool"
+    // `typeName` is the type's *internal* canonical name -- the key the architecture's width table
+    // is keyed on -- and it is not always C: `long long` is spelled `longlong` there. Printed
+    // verbatim it yielded a file that does not parse. It went unnoticed only because the parser
+    // used
+    // to fall back to a permissive mode, which took `longlong` for a typedef'd type name.
+    is CLongLong -> "long long"
     else -> this.typeName
   }
 
@@ -342,7 +370,10 @@ fun IteExpr<*>.toC(parseContext: ParseContext): String =
 // nullary: ref + lit
 fun NullaryExpr<*>.toC(parseContext: ParseContext): String =
   when (this) {
-    is RefExpr<*> -> this.decl.name.toC()
+    is RefExpr<*> ->
+      if (parseContext.metadata.getMetadataValue(decl.name, "isAnyPrev").isPresent)
+        "\\at(${parseContext.metadata.getMetadataValue(decl.name, "cName").get()}, AnyPrev)"
+      else decl.name.toC()
     is LitExpr<*> -> (this as LitExpr<*>).toC(parseContext)
     else -> TODO("Not yet supported: $this")
   }
@@ -355,27 +386,188 @@ fun LitExpr<*>.toC(parseContext: ParseContext): String =
     is RatLitExpr -> "(${this.num}.0/${this.denom}.0)"
     is FpLitExpr -> FpUtils.fpLitExprToBigFloat(FpRoundingMode.RNE, this).toString()
     is BvLitExpr -> BvUtils.neutralBvLitExprToBigInteger(this).toString()
-    else -> error("Not supported: $this")
+    else -> TODO("Not yet supported: $this")
+  }
+
+/**
+ * A C condition stating that [lhs], of C type [type], holds this value: a C11 constant of the
+ * type's signedness, or null if the value cannot be written exactly (e.g. long double, pointers).
+ */
+fun LitExpr<*>.toCConstraint(lhs: String, type: CComplexType?): String? =
+  when (type) {
+    // pointers are integers in Theta, but a pointer may only be compared to a pointer constant
+    is CPointer -> null
+    is CInteger -> {
+      val value =
+        when (this) {
+          is IntLitExpr -> this.value
+          is BvLitExpr ->
+            if (type.isSsigned) BvUtils.signedBvLitExprToBigInteger(this)
+            else BvUtils.unsignedBvLitExprToBigInteger(this)
+          is TrueExpr -> BigInteger.ONE
+          is FalseExpr -> BigInteger.ZERO
+          else -> null
+        }
+      value?.let { cIntegerConstant(it, type.isSsigned) }?.let { "$lhs == $it" }
+    }
+
+    is CFloat,
+    is CDouble -> {
+      val fp = this as? FpLitExpr
+      val bigFloat = fp?.let { FpUtils.fpLitExprToBigFloat(FpRoundingMode.RNE, it) }
+      val max = if (type is CFloat) "3.4028234663852886e+38f" else "1.7976931348623157e+308"
+      when {
+        bigFloat == null -> null
+        bigFloat.isNaN -> "$lhs != $lhs"
+        bigFloat.isInfinite -> if (bigFloat.sign()) "$lhs < -$max" else "$lhs > $max"
+        type is CFloat -> "$lhs == ${bigFloat.toFloat()}f"
+        else -> "$lhs == ${bigFloat.toDouble()}"
+      }
+    }
+
+    else -> null
+  }
+
+private val INT_MIN = BigInteger.valueOf(Int.MIN_VALUE.toLong())
+private val INT_MAX = BigInteger.valueOf(Int.MAX_VALUE.toLong())
+private val LONG_MIN = BigInteger.valueOf(Long.MIN_VALUE)
+private val LONG_MAX = BigInteger.valueOf(Long.MAX_VALUE)
+private val UINT_MAX = BigInteger.ONE.shiftLeft(32).subtract(BigInteger.ONE)
+private val ULONG_MAX = BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE)
+
+/** A C11 integer constant with the value and signedness; the minimum is not a negated literal. */
+private fun cIntegerConstant(value: BigInteger, signed: Boolean): String? =
+  if (signed) {
+    when {
+      value == INT_MIN -> "(-2147483647-1)"
+      value in INT_MIN..INT_MAX -> value.toString()
+      value == LONG_MIN -> "(-9223372036854775807LL-1)"
+      value in LONG_MIN..LONG_MAX -> "${value}LL"
+      else -> null
+    }
+  } else {
+    when {
+      value.signum() < 0 -> null
+      value <= UINT_MAX -> "${value}U"
+      value <= ULONG_MAX -> "${value}ULL"
+      else -> null
+    }
   }
 
 fun UnaryExpr<*, *>.toC(parseContext: ParseContext): String =
-  "(${this.cOperator()} ${op.toC(parseContext)})"
+  when (this) {
+    is IntToRatExpr -> "(${this.op.toC(parseContext)} / 1.0)"
+    is RatToIntExpr -> {
+      // Emulate SMT-LIB semantics, which rounds towards negative infinity
+      val rat = this.op.toC(parseContext)
+      val castRat = "((int) $rat)"
+      (this.op as? RatLitExpr)?.run {
+        if (num.signum() != denom.signum() && num % denom != BigInteger.ZERO) "($castRat - 1)"
+        else castRat
+      } ?: "($rat < 0.0 && $rat - $castRat < 0 ? $castRat - 1 : $castRat)"
+    }
+    is BvToIntExpr -> "((int) ${this.op.toC(parseContext)})"
+    is NotExpr -> "(! ${this.op.toC(parseContext)})"
+    is FpAbsExpr -> {
+      val fp = this.op.toC(parseContext)
+      "($fp < 0.0f ? (- $fp) : $fp)"
+    }
+    is FpNegExpr -> "(- ${this.op})"
+    is FpToFpExpr -> "(${this.op})"
+    is BvNegExpr,
+    is BvNotExpr,
+    is BvPosExpr,
+    is BvSignChangeExpr,
+    is FpFromBvExpr,
+    is FpToBvExpr,
+    is FpIsInfiniteExpr,
+    is FpPosExpr,
+    is FpSqrtExpr,
+    is FpIsNanExpr,
+    is PrimeExpr -> TODO("Not yet supported: $this")
+    else -> "(${this.cOperator()} ${op.toC(parseContext)})"
+  }
 
 fun BinaryExpr<*, *>.toC(parseContext: ParseContext): String =
-  if (leftOp.type is ArrayType<*, *>) {
-    "${this.arrayCOperator()}(${leftOp.toC(parseContext)}, ${rightOp.toC(parseContext)})"
-  } else if (this is ModExpr<*>) {
-    "( (${leftOp.toC(parseContext)} % ${rightOp.toC(parseContext)} + ${rightOp.toC(parseContext)}) % ${
-            rightOp.toC(parseContext)
-        } )"
-  } else {
-    "(${leftOp.toC(parseContext)} ${this.cOperator()} ${rightOp.toC(parseContext)})"
+  when {
+    leftOp.type is ArrayType<*, *> ->
+      "${this.arrayCOperator()}(${leftOp.toC(parseContext)}, ${rightOp.toC(parseContext)})"
+    this is FpAssignExpr ->
+      "(${leftOp.toC(parseContext)} ${this.cOperator()} ${rightOp.toC(parseContext)})"
+    this is EqExpr<*> -> "(${leftOp.toC(parseContext)} == ${rightOp.toC(parseContext)})"
+    this is XorExpr -> "(${leftOp.toC(parseContext)} ^ ${rightOp.toC(parseContext)})"
+    this is NeqExpr<*> -> "(${leftOp.toC(parseContext)} != ${rightOp.toC(parseContext)})"
+    leftOp.type is BvType -> {
+      when (this) {
+        is BvSubExpr -> "(${leftOp.toC(parseContext)} - ${rightOp.toC(parseContext)})"
+        is BvUGeqExpr -> "(${leftOp.toC(parseContext)} >= ${rightOp.toC(parseContext)})"
+        is BvUGtExpr -> "(${leftOp.toC(parseContext)} > ${rightOp.toC(parseContext)})"
+        is BvULtExpr -> "(${leftOp.toC(parseContext)} < ${rightOp.toC(parseContext)})"
+        is BvULeqExpr -> "(${leftOp.toC(parseContext)} <= ${rightOp.toC(parseContext)})"
+        else -> TODO("Not yet supported: $this")
+      }
+    }
+    this is FpMaxExpr -> {
+      val lhs = leftOp.toC(parseContext)
+      val rhs = rightOp.toC(parseContext)
+      "($lhs > $rhs ? $lhs : $rhs)"
+    }
+    this is FpMinExpr -> {
+      val lhs = leftOp.toC(parseContext)
+      val rhs = rightOp.toC(parseContext)
+      "($lhs < $rhs ? $lhs : $rhs)"
+    }
+    this is ModExpr<*> -> {
+      if (this is IntModExpr && this.isDomainBound(parseContext)) {
+        leftOp.toC(parseContext)
+      } else {
+        // Emulate SMT-LIB semantics: always positive
+        //  5 mod  3 = 2
+        //  5 mod -3 = 2
+        // -5 mod  3 = 1
+        // -5 mod -3 = 1
+        val lhs = leftOp.toC(parseContext)
+        val rhs = rightOp.toC(parseContext)
+        (rightOp as? IntLitExpr)?.run {
+          if (value < BigInteger.ZERO) "( ($lhs % $rhs - $rhs) % $rhs )"
+          else "( ($lhs % $rhs + $rhs) % $rhs )"
+        } ?: "( ($lhs % $rhs + ($rhs < 0 ? - $rhs : $rhs)) % $rhs )"
+      }
+    }
+    this is RemExpr<*> -> {
+      // Emulate SMT-LIB semantics:
+      //  5 rem  3 =  2
+      //  5 rem -3 = -2
+      // -5 rem  3 =  1
+      // -5 rem -3 = -1
+      val rhs = rightOp.toC(parseContext)
+      val mod = ModExpr.create2(leftOp, rightOp).toC(parseContext)
+      (rightOp as? IntLitExpr)?.run { if (value < BigInteger.ZERO) "(- $mod)" else mod }
+        ?: "($rhs < 0 ? - $mod : $mod)"
+    }
+    this is DivExpr<*> -> "(${leftOp.toC(parseContext)} / ${rightOp.toC(parseContext)})"
+    this is ImplyExpr -> "(! ${leftOp.toC(parseContext)} || ${rightOp.toC(parseContext)})"
+    else -> "(${leftOp.toC(parseContext)} ${this.cOperator()} ${rightOp.toC(parseContext)})"
   }
 
-fun MultiaryExpr<*, *>.toC(parseContext: ParseContext): String =
-  ops.joinToString(separator = " ${this.cOperator()} ", prefix = "(", postfix = ")") {
-    it.toC(parseContext)
+fun MultiaryExpr<*, *>.toC(parseContext: ParseContext): String {
+  val join = { sep: String ->
+    ops.joinToString(separator = " $sep ", prefix = "(", postfix = ")") { it.toC(parseContext) }
   }
+  return when (this) {
+    is AndExpr -> join("&&")
+    is OrExpr -> join("||")
+    is BvAddExpr -> join("+")
+    is BvAndExpr -> join("&&")
+    is BvMulExpr -> join("*")
+    is BvOrExpr -> join("|")
+    is BvXorExpr -> join("^")
+    is FpAddExpr -> join("+")
+    is FpMulExpr -> join("*")
+    is ArrayInitExpr<*, *> -> TODO("Not yet supported: $this")
+    else -> join(this.cOperator())
+  }
+}
 
 fun Expr<*>.cOperator() =
   when (this) {
@@ -386,6 +578,10 @@ fun Expr<*>.cOperator() =
     is NotExpr -> "!"
     // is ModExpr<*> -> "%" // handled above
     is DivExpr<*> -> "/"
+    // Unary plus, whatever the type. Only the integer one happens to label itself "+"; the
+    // bitvector one says "bvpos", which is not C -- and falling through to `operatorLabel` below
+    // would emit it verbatim and produce a file that does not parse.
+    is PosExpr<*> -> "+"
 
     is UnaryExpr<*, *> -> operatorLabel
     is BinaryExpr<*, *> -> operatorLabel
@@ -400,4 +596,22 @@ fun Expr<*>.arrayCOperator() =
     else -> TODO("Not yet implemented array operator label for expr: $this")
   }
 
-fun String.toC() = this.replace(Regex("[^A-Za-z_0-9]"), "_")
+fun String.toC() = this.replace(Regex("[^A-Za-z_0-9$]"), "_")
+
+private fun IntModExpr.isDomainBound(parseContext: ParseContext): Boolean {
+  val m = rightOp as? IntLitExpr ?: return false
+
+  val type =
+    try {
+      CComplexType.getType(leftOp, parseContext)
+    } catch (e: UnsupportedFrontendElementException) {
+      return false
+    }
+
+  val width = parseContext.architecture.getBitWidth(type.typeName)
+  val minValue = BigInteger.TWO.pow(width - 1).negate()
+  val maxValue = BigInteger.TWO.pow(width)
+
+  return if (type.origin?.isSigned == true) m.value == minValue || m.value == maxValue
+  else m.value == maxValue
+}
